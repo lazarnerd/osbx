@@ -6,6 +6,8 @@
 //! seals the resulting QCOW2 base disk + persistent `OVMF_VARS_4M.fd` as a reusable template in
 //! `$OSBX_HOME/templates/`.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 use crate::state::{Launch, assets_dir, check_name, home, write_atomic};
 use serde_json::json;
 use std::io;
