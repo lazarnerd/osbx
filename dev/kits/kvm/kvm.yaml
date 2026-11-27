@@ -1,0 +1,22 @@
+# syntax=docker/sandbox-kit:3
+#
+# Hardware virtualization for the sandbox: /dev/kvm and /dev/vhost-vsock usable by
+# the agent user (spec: capabilities/com.docker.sandbox/kvm@1).
+#
+# - REQUIRED on purpose: the VMM work cannot run without KVM, so sbx should refuse
+#   to create the sandbox (naming kvm@1) instead of starting one that cannot work.
+# - Config-less: the spec forbids any `config`, even an empty one.
+# - Gated: adding it stops for approval even if privileged/dockerd were approved.
+# - Host support: Linux needs /dev/kvm and membership of the `kvm` group; a Windows
+#   or macOS host needs nested virtualization (documented for sbx only on Apple
+#   Silicon M3+). If the host cannot grant it, use sbxenv.yaml.template instead.
+# - Grants no privileged mode, FUSE, Docker Engine or storage: declare those separately.
+schemaVersion: "3"
+displayName: KVM access
+description: Usable /dev/kvm and /dev/vhost-vsock for running hardware-accelerated VMs inside the sandbox
+licenses: [Apache-2.0]
+kind: mixin
+version: 1.0.0
+capabilities:
+    - type: com.docker.sandbox/kvm@1
+      description: Runs the osbx VMM and its test guests with hardware acceleration

@@ -1,0 +1,122 @@
+#!/bin/busybox sh
+# osbx guest init (PID 1 in the initramfs). Mode comes from the kernel command line:
+#   osbx.mode=test   print a banner, run self-checks, power off (default)
+#   osbx.mode=agent  load vsock, run osbx-agent (exec/tunnels/egress) until the host powers off
+#   osbx.mode=blk    mount /dev/vda, read hello.txt, write from-guest.txt
+#   osbx.mode=kvm    load kvm modules, run `osbx vmm probe --run-guest` inside the guest (nested KVM)
+#   osbx.mode=shell  drop to an interactive shell on the console
+export PATH=/bin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm && mount -t devpts devpts /dev/pts && mount -t tmpfs tmpfs /dev/shm
+
+mode=test
+for arg in $(cat /proc/cmdline); do
+  case "$arg" in osbx.mode=*) mode=${arg#osbx.mode=} ;; esac
+done
+
+echo "osbx-guest: up: kernel $(uname -r), $(nproc) cpu, $(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) MiB RAM, mode=$mode"
+echo "osbx-guest: console=$(cat /sys/class/tty/console/active 2>/dev/null)"
+echo "osbx-guest: /dev/kvm $( [ -e /dev/kvm ] && echo present || echo absent )"
+echo "osbx-guest: cpu virt flags: $(grep -o -m1 -E 'vmx|svm' /proc/cpuinfo | head -1)"
+
+if [ "$mode" = agent ]; then
+  # control channel: vsock driver, then the agent as the long-running process (never returns).
+  for m in $(cat /etc/vsock-modules); do insmod "$m" 2>/dev/null; done
+  ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null
+  echo "osbx-guest: /dev/vsock $( [ -e /dev/vsock ] && echo present || echo absent )"
+  root=""; shares=""; kvm=""; docker=""
+  for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+      root=*) root=${arg#root=} ;;
+      osbx.share=*) shares="$shares ${arg#osbx.share=}" ;;
+      osbx.kvm=1) kvm=1 ;;
+      osbx.docker=1) docker=1 ;;
+    esac
+  done
+  if [ -n "$docker" ]; then
+    for m in $(cat /etc/docker-modules); do insmod "$m" 2>/dev/null; done
+    echo "osbx-guest: docker modules loaded ($(grep -cE '^(overlay|bridge|veth|br_netfilter) ' /proc/modules)/4 core)"
+  fi
+  if [ -n "$kvm" ]; then
+    # kvm@1: usable /dev/kvm and /dev/vhost-vsock for every user in the sandbox
+    for m in $(cat /etc/kvm-modules); do insmod "$m" 2>/dev/null; done
+    chmod 0666 /dev/kvm /dev/vhost-vsock 2>/dev/null
+    echo "osbx-guest: kvm $( [ -c /dev/kvm ] && echo ready || echo FAILED ), vhost-vsock $( [ -c /dev/vhost-vsock ] && echo ready || echo FAILED )"
+  fi
+  prefix=""
+  [ -n "$root" ] && prefix=/newroot && mkdir -p /newroot
+  if [ -n "$root" ]; then
+    if ! mount -t ext4 "$root" /newroot; then
+      echo "osbx-guest: cannot mount root $root"; reboot -f
+    fi
+    # The host may have grown the disk image (rootSize): grow the filesystem to match, online.
+    if [ -x /sbin/resize2fs ]; then
+      out=$(/sbin/resize2fs "$root" 2>&1) || echo "osbx-guest: resize2fs $root failed: $out"
+      case "$out" in *"is now"*) echo "osbx-guest: root filesystem grown to fill the disk" ;; esac
+    fi
+    mkdir -p /newroot/run /newroot/tmp
+    mount -t tmpfs tmpfs /newroot/run
+    mount -t tmpfs tmpfs /newroot/tmp
+  fi
+  if [ -n "$shares" ]; then
+    for m in $(cat /etc/fs-modules); do insmod "$m" 2>/dev/null; done
+    for s in $shares; do
+      tag=${s%%:*}; path=${s#*:}; opts=""
+      case "$path" in *:ro) path=${path%:ro}; opts="-o ro" ;; esac
+      mkdir -p "$prefix$path"
+      if mount -t virtiofs $opts "$tag" "$prefix$path"; then
+        echo "osbx-guest: shared $tag at $path"
+      else
+        echo "osbx-guest: mounting share $tag at $path FAILED"
+      fi
+    done
+  fi
+  if [ -n "$root" ]; then
+    # a real root filesystem: mount it, move the pseudo-filesystems across, run the agent from it
+    mkdir -p /newroot/proc /newroot/sys /newroot/dev
+    mount --move /proc /newroot/proc
+    mount --move /sys /newroot/sys
+    mount --move /dev /newroot/dev
+    mount -t cgroup2 cgroup2 /newroot/sys/fs/cgroup 2>/dev/null
+    echo "osbx-guest: switching to root $root"
+    exec switch_root /newroot /usr/local/bin/osbx-agent
+  fi
+  exec /bin/osbx-agent
+fi
+
+if [ "$mode" = blk ]; then
+  # virtio-blk: mount the first disk, read a file the host put there, write one back.
+  echo "osbx-guest: /dev/vda $( [ -b /dev/vda ] && echo present || echo absent ), $(cat /sys/block/vda/size 2>/dev/null) sectors"
+  mkdir -p /mnt
+  if mount -t ext4 /dev/vda /mnt; then
+    echo "osbx-guest: blk read: $(cat /mnt/hello.txt)"
+    echo "written-by-guest" > /mnt/from-guest.txt
+    dd if=/dev/zero of=/mnt/zeros bs=1M count=4 2>/dev/null
+    sync
+    umount /mnt
+    echo "osbx-guest: blk done"
+  else
+    echo "osbx-guest: blk mount FAILED"
+  fi
+fi
+
+if [ "$mode" = kvm ]; then
+  # kvm@1 inside the guest: load KVM, then run the probe and a nested guest.
+  for m in $(cat /etc/kvm-modules); do insmod "$m" 2>&1 || echo "osbx-guest: insmod $m failed"; done
+  echo "osbx-guest: /dev/kvm $( [ -e /dev/kvm ] && echo present || echo absent ), /dev/vhost-vsock $( [ -e /dev/vhost-vsock ] && echo present || echo absent )"
+  echo "osbx-guest: nested param: $(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)"
+  if [ -x /bin/osbx-probe ]; then
+    /bin/osbx-probe --run-guest --require-nested && echo "osbx-guest: KVM-IN-GUEST OK" || echo "osbx-guest: KVM-IN-GUEST FAILED"
+  else
+    echo "osbx-guest: no /bin/osbx-probe in this initramfs (build with --with-osbx)"
+  fi
+fi
+
+if [ "$mode" = shell ]; then
+  echo "osbx-guest: shell (type 'reboot -f' to exit)"
+  setsid sh -c 'exec sh </dev/console >/dev/console 2>&1'
+fi
+echo "osbx-guest: done"
+reboot -f

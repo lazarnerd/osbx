@@ -1,0 +1,15 @@
+[package]
+name = "osbx-kit"
+description = "Kit v3 descriptor model, validation, arg expansion and set resolution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+regex = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "osbx-image"
+description = "Build a bootable ext4 root filesystem from an OCI image (natively in a builder VM, or with Docker)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+flate2 = "1"
+ruzstd = "0.8"
+tar = { version = "0.4", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+osbx-policy.workspace = true
+osbx-proto = { path = "../osbx-proto" }
+osbx-proxy = { path = "../osbx-proxy" }
+osbx-sandbox = { path = "../osbx-sandbox" }
+osbx-vmm = { path = "../osbx-vmm" }
+
+[lints]
+workspace = true

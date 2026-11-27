@@ -1,0 +1,41 @@
+# sbxenv.yaml for the osbx project, WITH KVM passthrough (variant of sbxenv.yaml.template).
+#
+# PLACE THIS FILE in the folder that CONTAINS osbx/ (the host-script
+# dev/host-setup.* copies it there if it is missing).  Everything the sandbox
+# should keep across re-creation lives next to it on the host:
+#
+#   <this folder>/sbxenv.yaml
+#   <this folder>/osbx/               project + dev/ scripts + .claude/skills
+#   <this folder>/sessions/           Claude sessions, todos, ...   (see kit below)
+#   <this folder>/cache/              cargo registry/git + sccache  (compiled artifacts)
+#
+# Prerequisites: `sbx login`; run dev/host-setup.* once (creates the folders).
+# Commands:      sbx env plan | sbx env run | sbx env rm
+schemaVersion: "1"
+
+name: osbx
+agent: claude
+workspace: ./osbx
+
+kits:
+  # Declares the four host-mount@1 paths below (sbx rejects a `mounts:` entry that no
+  # kit declares) and links Claude sessions into one of them. Replaces
+  # sbx/claude-sessions:1.0.0 so sessions live in ./sessions, not in app data.
+  - ./osbx/dev/kits/host-state
+  # /dev/kvm + /dev/vhost-vsock for the VMM. Needs a host that can grant it (Linux with
+  # /dev/kvm and the kvm group, or nested virtualization). sbx will ask you to approve
+  # it, and refuses (naming kvm@1) when the host cannot. No KVM on this host? Use
+  # sbxenv.yaml.template, which omits this line.
+  - ./osbx/dev/kits/kvm
+
+# sandbox path -> host directory.  Host dirs must exist (host-setup.* makes them).
+mounts:
+  /home/agent/claude-history:   "${{ env.fileDir }}/sessions"
+  /home/agent/.cargo/registry:  "${{ env.fileDir }}/cache/cargo-registry"
+  /home/agent/.cargo/git:       "${{ env.fileDir }}/cache/cargo-git"
+  /home/agent/.cache/sccache:   "${{ env.fileDir }}/cache/sccache"
+
+env:
+  SCCACHE_DIR: /home/agent/.cache/sccache
+  SCCACHE_CACHE_SIZE: 20G
+  CARGO_INCREMENTAL: "0"

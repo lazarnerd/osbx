@@ -1,0 +1,68 @@
+# syntax=docker/sandbox-kit:3
+#
+# Declares the host-shared directories that sbxenv.yaml may place on the host.
+#
+# sbx only accepts a `mounts:` entry in sbxenv.yaml when a kit declares
+# host-mount@1 at that sandbox path ("no kit declares host-mount@1 at ...").
+# The kit owns the sandbox path; sbxenv.yaml picks the host folder, e.g.
+#
+#   mounts:
+#     /home/agent/claude-history: "${{ env.fileDir }}/sessions"
+#
+# Also carries the session-linking hook of docker's sbx/claude-sessions:1.0.0
+# (same logic). Do NOT combine this kit with sbx/claude-sessions: both would
+# declare the /home/agent/claude-history mount.
+schemaVersion: "3"
+displayName: osbx host state (sessions + build caches)
+description: Host-shared Claude sessions, cargo registry/git and sccache, with the session-link hook
+licenses: [Apache-2.0]
+kind: mixin
+version: 1.0.0
+requires: ["claude"]
+capabilities:
+    - type: com.docker.sandbox/host-mount@1
+      config:
+        path: /home/agent/claude-history
+        mode: "0700"
+    - type: com.docker.sandbox/host-mount@1
+      config:
+        path: /home/agent/.cargo/registry
+        mode: "0700"
+    - type: com.docker.sandbox/host-mount@1
+      config:
+        path: /home/agent/.cargo/git
+        mode: "0700"
+    - type: com.docker.sandbox/host-mount@1
+      config:
+        path: /home/agent/.cache/sccache
+        mode: "0700"
+    - type: com.docker.sandbox/lifecycle@1
+      config:
+        install:
+            - command: |
+                set -eu
+                state="/home/agent/.claude"
+                history="/home/agent/claude-history"
+                mkdir -p "$state"
+                for name in projects sessions todos shell-snapshots statsig; do
+                  link="$state/$name"
+                  target="$history/$name"
+                  mkdir -p "$target"
+                  if [ -L "$link" ]; then
+                    if [ "$(readlink "$link")" != "$target" ]; then
+                      printf 'Refusing to replace unexpected symlink: %s\n' "$link" >&2
+                      exit 1
+                    fi
+                    continue
+                  fi
+                  # rmdir preserves existing sessions and refuses mounted volumes.
+                  if [ -e "$link" ]; then
+                    if ! rmdir "$link"; then
+                      printf 'Cannot replace %s; move existing state to the host directory first.\n' "$link" >&2
+                      exit 1
+                    fi
+                  fi
+                  ln -s "$target" "$link"
+                done
+              user: agent
+              description: Link Claude session state to the host-shared directory

@@ -1,0 +1,50 @@
+[package]
+name = "osbx-cli"
+description = "osbx command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "osbx"
+path = "src/main.rs"
+
+[dependencies]
+osbx-policy.workspace = true
+osbx-proto = { path = "../osbx-proto" }
+osbx-secrets = { path = "../osbx-secrets" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+osbx-kit = { path = "../osbx-kit" }
+osbx-env = { path = "../osbx-env" }
+osbx-vmm = { path = "../osbx-vmm" }
+clap.workspace = true
+
+# Sandboxes: hosts with a hypervisor backend.
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+osbx-sandbox = { path = "../osbx-sandbox" }
+osbx-image = { path = "../osbx-image" }
+osbx-proxy = { path = "../osbx-proxy" }
+tokio = { version = "1", features = ["sync"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1"
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation"] }
+
+[dev-dependencies]
+tar = { version = "0.4", default-features = false }
+
+[lints.rust]
+# Terminal handling (raw mode, window size) needs a few OS calls: unsafe is denied crate-wide
+# and allowed only in small functions whose every unsafe block carries a `SAFETY:` comment.
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

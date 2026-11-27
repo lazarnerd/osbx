@@ -1,0 +1,19 @@
+[package]
+name = "osbx-secrets"
+description = "Credential storage, scoping, dynamic sources, bindings and header injection for osbx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+osbx-policy.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

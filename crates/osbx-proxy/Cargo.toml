@@ -1,0 +1,27 @@
+[package]
+name = "osbx-proxy"
+description = "Policy-enforcing egress proxy with TLS interception and credential injection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+osbx-policy.workspace = true
+osbx-secrets = { path = "../osbx-secrets" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "osbx-sandbox"
+description = "A running osbx sandbox: microVM + guest agent + policy-enforcing egress proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+osbx-policy.workspace = true
+osbx-proto = { path = "../osbx-proto" }
+osbx-proxy = { path = "../osbx-proxy" }
+osbx-secrets = { path = "../osbx-secrets" }
+osbx-vmm = { path = "../osbx-vmm" }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "sync", "macros"] }
+
+[dev-dependencies]
+osbx-image = { path = "../osbx-image" }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[lints]
+workspace = true

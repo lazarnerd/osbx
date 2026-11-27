@@ -1,0 +1,10 @@
+[package]
+name = "osbx-policy"
+description = "Network policy model and evaluation engine for osbx sandboxes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
