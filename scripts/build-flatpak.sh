@@ -6,6 +6,7 @@
 #   --install            Install or upgrade io.github.lazarnerd.osbx for the current user from the
 #                        local OSTree repo (so re-running this script upgrades in place cleanly).
 #   --no-shim            With --install, do not install the ~/.local/bin/osbx wrapper script.
+#   --bin-dir DIR        With --install, directory for the `osbx` wrapper (default: ~/.local/bin).
 #   --skip-build         Reuse existing target/release/osbx instead of running `cargo build --release`.
 #   --rebuild-assets     Also rebuild guest assets via `guest/build-assets.sh --offline --with-osbx`.
 #   --output DIR         Output directory for repo and .flatpak bundle (default: <repo>/dist/flatpak).
@@ -35,6 +36,7 @@ REPO_ROOT=$(cd "$HERE/.." && pwd)
 OUT="$REPO_ROOT/dist/flatpak"
 INSTALL=0
 INSTALL_SHIM=1
+SHIM_DIR="${OSBX_BIN_DIR:-$HOME/.local/bin}"
 SKIP_BUILD=0
 REBUILD_ASSETS=0
 REPO_URL=""
@@ -45,6 +47,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --install)        INSTALL=1 ;;
     --no-shim)        INSTALL_SHIM=0 ;;
+    --bin-dir)        SHIM_DIR="${2:?--bin-dir needs a directory}"; shift ;;
     --skip-build)     SKIP_BUILD=1 ;;
     --rebuild-assets) REBUILD_ASSETS=1 ;;
     --output)         OUT="${2:?--output needs a directory}"; shift ;;
@@ -53,7 +56,7 @@ while [ $# -gt 0 ]; do
     --branch)         BRANCH="${2:?--branch needs a branch}"; shift ;;
     --gpg-sign)       GPG_SIGN="${2:?--gpg-sign needs a key id}"; shift ;;
     --gpg-homedir)    GPG_HOMEDIR="${2:?--gpg-homedir needs a dir}"; shift ;;
-    -h|--help)        sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help)        sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -181,14 +184,15 @@ if [ "$INSTALL" = 1 ]; then
     flatpak install --user -y "$REMOTE" "$APP_ID//$BRANCH"
   fi
   if [ "$INSTALL_SHIM" = 1 ]; then
-    SHIM_DIR="$HOME/.local/bin"
     mkdir -p "$SHIM_DIR"
-    cat > "$SHIM_DIR/osbx" <<EOF
+    SHIM_PATH="${SHIM_DIR%/}/osbx"
+    rm -f "$SHIM_PATH"
+    cat > "$SHIM_PATH" <<EOF
 #!/bin/sh
 exec flatpak run $APP_ID "\$@"
 EOF
-    chmod 0755 "$SHIM_DIR/osbx"
-    echo "==> installed wrapper $SHIM_DIR/osbx"
+    chmod 0755 "$SHIM_PATH"
+    echo "==> installed wrapper $SHIM_PATH"
   fi
 fi
 
@@ -198,7 +202,11 @@ echo "  Bundle : $BUNDLE"
 echo "  Latest : $OUT/osbx.flatpak"
 echo "  Repo   : $OSTREE_REPO"
 if [ "$INSTALL" = 1 ]; then
-  echo "  Installed: flatpak run $APP_ID --version"
+  if [ "$INSTALL_SHIM" = 1 ]; then
+    echo "  Installed: osbx --version (wrapper: ${SHIM_DIR%/}/osbx)"
+  else
+    echo "  Installed: flatpak run $APP_ID --version"
+  fi
   echo "  Upgrade later: ./scripts/build-flatpak.sh --install"
 else
   echo "  Install: flatpak install --user $OUT/osbx.flatpak"

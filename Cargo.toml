@@ -1,16 +1,17 @@
 [workspace]
 resolver = "3"
-members = ["crates/osbx-policy", "crates/osbx-cli", "crates/osbx-kit", "crates/osbx-secrets", "crates/osbx-proxy", "crates/osbx-env", "crates/osbx-vmm", "crates/osbx-proto", "crates/osbx-agent", "crates/osbx-sandbox", "crates/osbx-image"]
+members = ["crates/osbx-policy", "crates/osbx-spec", "crates/osbx-cli", "crates/osbx-kit", "crates/osbx-secrets", "crates/osbx-proxy", "crates/osbx-env", "crates/osbx-compose", "crates/osbx-vmm", "crates/osbx-proto", "crates/osbx-agent", "crates/osbx-sandbox", "crates/osbx-image"]
 exclude = ["third_party"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.3"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.90"
 
 [workspace.dependencies]
 osbx-policy = { path = "crates/osbx-policy" }
+osbx-spec = { path = "crates/osbx-spec" }
 clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]

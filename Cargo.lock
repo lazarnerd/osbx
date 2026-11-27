@@ -828,7 +828,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "osbx-agent"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "libc",
  "osbx-proto",
@@ -838,10 +838,11 @@ dependencies = [
 
 [[package]]
 name = "osbx-cli"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "clap",
  "libc",
+ "osbx-compose",
  "osbx-env",
  "osbx-image",
  "osbx-kit",
@@ -850,6 +851,7 @@ dependencies = [
  "osbx-proxy",
  "osbx-sandbox",
  "osbx-secrets",
+ "osbx-spec",
  "osbx-vmm",
  "serde",
  "serde_json",
@@ -861,9 +863,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "osbx-env"
-version = "0.0.1"
+name = "osbx-compose"
+version = "0.0.3"
 dependencies = [
+ "osbx-spec",
+ "regex",
+ "serde",
+ "serde_yaml_ng",
+]
+
+[[package]]
+name = "osbx-env"
+version = "0.0.3"
+dependencies = [
+ "osbx-spec",
  "regex",
  "serde",
  "serde_yaml_ng",
@@ -871,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-image"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "flate2",
  "osbx-policy",
@@ -888,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-kit"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "regex",
  "serde",
@@ -897,11 +910,11 @@ dependencies = [
 
 [[package]]
 name = "osbx-policy"
-version = "0.0.1"
+version = "0.0.3"
 
 [[package]]
 name = "osbx-proto"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -909,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-proxy"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -927,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-sandbox"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -944,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-secrets"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "osbx-policy",
  "serde",
@@ -954,8 +967,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "osbx-spec"
+version = "0.0.3"
+dependencies = [
+ "osbx-policy",
+ "serde",
+]
+
+[[package]]
 name = "osbx-vmm"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "fuse-backend-rs",
  "kvm-bindings",
