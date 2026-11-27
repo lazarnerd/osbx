@@ -155,12 +155,44 @@ impl Credentials for StoreCredentials {
     }
 }
 
-/// The sandbox's policy: stored preset and rules, plus the rules its kits declare for `phase`
-/// (`runtime` normally; `install` adds the install-phase rules while install hooks run).
+/// The sandbox's policy: stored preset and rules, plus sandbox firewall rules and kit rules for
+/// `phase` (`runtime` normally; `install` adds the install-phase rules while install hooks run).
 fn effective_policy(rec: &Record, phase: &str) -> Result<PolicySet, String> {
     let mut p = StoredPolicy::load()
         .map_err(|e| e.to_string())?
         .to_policy()?;
+    if let Some(fw) = &rec.firewall {
+        if let Some(def) = fw.default {
+            p.preset = def.to_preset();
+        }
+        for r in &fw.rules {
+            let active = matches!(r.phase, osbx_spec::FirewallPhase::Runtime)
+                || (matches!(r.phase, osbx_spec::FirewallPhase::Install) && phase == "install");
+            if !active {
+                continue;
+            }
+            let action = match r.action {
+                osbx_spec::FirewallAction::Allow => osbx_policy::Action::Allow,
+                osbx_spec::FirewallAction::Deny => osbx_policy::Action::Deny,
+            };
+            let mut rule = osbx_policy::Rule::new(
+                action,
+                &r.dest,
+                osbx_policy::Origin::Sandbox(rec.name.clone()),
+            )
+            .map_err(|e| format!("firewall {}: {e}", r.dest))?;
+            rule.http = r.http.as_ref().map(|h| osbx_policy::HttpMatch {
+                methods: h.methods.clone(),
+                path: h.path.clone(),
+                query: h
+                    .query
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            });
+            p.rules.push(rule);
+        }
+    }
     for r in crate::kits::network_rules(&rec.kits) {
         if r.phase == "runtime" || r.phase == phase {
             let action = if r.allow {
@@ -311,6 +343,21 @@ pub fn supervise(name: &str) -> io::Result<()> {
             read_only: false,
         });
     }
+    // extra bind mounts / named volumes from osbx-compose.yml or sbxenv.yaml
+    for s in &rec.extra_shares {
+        if shares
+            .iter()
+            .any(|existing| existing.guest_path == s.guest_path)
+        {
+            continue;
+        }
+        std::fs::create_dir_all(&s.host_dir)?;
+        shares.push(Share {
+            host_dir: s.host_dir.clone(),
+            guest_path: s.guest_path.clone(),
+            read_only: s.read_only,
+        });
+    }
     let mut env = launch_env.clone();
     // kit create-phase args with `env:` delivery (user `-e` overrides them)
     for k in &rec.kits {
@@ -323,7 +370,9 @@ pub fn supervise(name: &str) -> io::Result<()> {
         .or_insert_with(|| "/usr/local/share/ca-certificates/osbx-ca.crt".into());
     // runtime-owned identity of the sandbox (sbx@1 asks for these; harmless for everyone)
     env.insert("SANDBOX_NAME".into(), name.to_owned());
-    if let Some(ws) = &rec.workspace {
+    if let Some(wd) = &rec.workdir {
+        env.insert("WORKSPACE_DIR".into(), wd.clone());
+    } else if let Some(ws) = &rec.workspace {
         env.insert("WORKSPACE_DIR".into(), crate::state::guest_path(&ws.host));
     }
     if crate::kits::sbx_platform(&rec.kits) {

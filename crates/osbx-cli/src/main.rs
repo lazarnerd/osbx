@@ -7,6 +7,7 @@
 
 #[cfg(any(target_os = "linux", windows))]
 mod client;
+mod compose;
 #[cfg(any(target_os = "linux", windows))]
 mod images;
 mod kits;
@@ -202,6 +203,13 @@ enum Cmd {
         #[command(subcommand)]
         command: EnvCmd,
     },
+    /// osbx-compose.yml tools (Docker Compose-style sandbox environments)
+    Compose {
+        #[command(flatten)]
+        opts: ComposeGlobalArgs,
+        #[command(subcommand)]
+        command: ComposeCmd,
+    },
     /// Hypervisor tools
     Vmm {
         #[command(subcommand)]
@@ -284,6 +292,78 @@ enum EnvCmd {
         /// Do not merge ~/.sbxenv.yaml
         #[arg(long)]
         no_user_base: bool,
+    },
+    /// Render the compiled canonical internal spec IR for an sbxenv.yaml
+    Config {
+        /// Project file
+        #[arg(default_value = "sbxenv.yaml")]
+        file: std::path::PathBuf,
+        /// Value for a declared env arg, `name=value` (repeatable)
+        #[arg(long = "env-arg")]
+        env_args: Vec<String>,
+        /// Do not merge ~/.sbxenv.yaml
+        #[arg(long)]
+        no_user_base: bool,
+        /// Output JSON instead of YAML
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Flags shared by all `osbx compose` subcommands.
+#[derive(Args, Clone, Debug)]
+struct ComposeGlobalArgs {
+    /// Compose file(s) to load in order (default: osbx-compose.yml or osbx-compose.yaml)
+    #[arg(short = 'f', long = "file")]
+    files: Vec<std::path::PathBuf>,
+    /// Enable optional profile(s) (repeatable)
+    #[arg(long = "profile")]
+    profiles: Vec<String>,
+    /// Value for a declared arg, `name=value` (repeatable)
+    #[arg(long = "arg")]
+    args: Vec<String>,
+    /// Do not merge ~/.osbx-compose.yml
+    #[arg(long)]
+    no_user_base: bool,
+}
+
+#[derive(Subcommand)]
+enum ComposeCmd {
+    /// Create and start sandboxes (attaches when a single sandbox is selected unless -d)
+    Up {
+        /// Start without attaching
+        #[arg(long, short = 'd')]
+        detach: bool,
+        /// Specific sandbox key(s) to start (default: all active)
+        sandboxes: Vec<String>,
+    },
+    /// Create/start one sandbox and attach (or run an alternate command)
+    Run {
+        /// Sandbox key (optional if only one active sandbox exists)
+        sandbox: Option<String>,
+        /// Command to run instead of the sandbox's default
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Stop (and with --rm, remove) sandboxes defined in the compose file
+    Down {
+        /// Remove the sandboxes and their disks (runs pre_remove host hooks first)
+        #[arg(long)]
+        rm: bool,
+        /// Specific sandbox key(s) (default: all active)
+        sandboxes: Vec<String>,
+    },
+    /// Show status of sandboxes defined in the compose file
+    Ps,
+    /// Print a dry-run summary of sandboxes, mounts, capabilities, firewall, and hooks
+    Plan,
+    /// Parse and validate osbx-compose.yml offline
+    Check,
+    /// Render the compiled canonical internal spec IR (YAML or --json)
+    Config {
+        /// Output JSON instead of YAML
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -462,6 +542,9 @@ fn create_opts(a: CreateArgs, agent: String) -> lifecycle::CreateOpts {
         template: a.template,
         root_size_mib: a.disk,
         mounts: Default::default(),
+        workdir: None,
+        extra_shares: Vec::new(),
+        firewall: None,
     }
 }
 
@@ -501,10 +584,10 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                 .collect();
             // like the agent itself, commands start in the workspace unless told otherwise
             let cwd = workdir.or_else(|| {
-                state::Record::load(&name)
-                    .ok()
-                    .and_then(|r| r.workspace)
-                    .map(|w| state::guest_path(&w.host))
+                state::Record::load(&name).ok().and_then(|r| {
+                    r.workdir
+                        .or_else(|| r.workspace.map(|w| state::guest_path(&w.host)))
+                })
             });
             let req = osbx_proto::ExecRequest {
                 argv: command,
@@ -591,6 +674,48 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                     detach,
                 },
         } => code(l::env_run(&file, &env_args, detach)),
+        Cmd::Compose {
+            opts,
+            command: ComposeCmd::Up { detach, sandboxes },
+        } => code(l::compose_up(
+            &opts.files,
+            &opts.profiles,
+            &opts.args,
+            opts.no_user_base,
+            detach,
+            &sandboxes,
+        )),
+        Cmd::Compose {
+            opts,
+            command: ComposeCmd::Run { sandbox, command },
+        } => code(l::compose_run(
+            &opts.files,
+            &opts.profiles,
+            &opts.args,
+            opts.no_user_base,
+            sandbox.as_deref(),
+            &command,
+        )),
+        Cmd::Compose {
+            opts,
+            command: ComposeCmd::Down { rm, sandboxes },
+        } => done(l::compose_down(
+            &opts.files,
+            &opts.profiles,
+            &opts.args,
+            opts.no_user_base,
+            rm,
+            &sandboxes,
+        )),
+        Cmd::Compose {
+            opts,
+            command: ComposeCmd::Ps,
+        } => done(l::compose_ps(
+            &opts.files,
+            &opts.profiles,
+            &opts.args,
+            opts.no_user_base,
+        )),
         _ => unreachable!("not a lifecycle command"),
     }
 }
@@ -633,6 +758,13 @@ fn main() -> ExitCode {
             | Cmd::Env {
                 command: EnvCmd::Run { .. }
             }
+            | Cmd::Compose {
+                command: ComposeCmd::Up { .. }
+                    | ComposeCmd::Run { .. }
+                    | ComposeCmd::Down { .. }
+                    | ComposeCmd::Ps,
+                ..
+            }
     );
     if lifecycle {
         return lifecycle_cmd(cmd);
@@ -667,6 +799,23 @@ fn main() -> ExitCode {
                     no_user_base,
                 },
         } => env_check(&file, &env_args, no_user_base),
+        Cmd::Env {
+            command:
+                EnvCmd::Config {
+                    file,
+                    env_args,
+                    no_user_base,
+                    json,
+                },
+        } => env_config(&file, &env_args, no_user_base, json),
+        Cmd::Compose {
+            opts,
+            command: ComposeCmd::Plan | ComposeCmd::Check,
+        } => compose_plan(&opts),
+        Cmd::Compose {
+            opts,
+            command: ComposeCmd::Config { json },
+        } => compose_config(&opts, json),
         Cmd::Policy {
             command: PolicyCmd::Baseline,
         } => {
@@ -768,72 +917,88 @@ fn kit_validate(files: &[std::path::PathBuf]) -> ExitCode {
     }
 }
 
+fn load_env_spec(
+    file: &std::path::Path,
+    env_args: &[String],
+    no_user_base: bool,
+) -> Result<osbx_spec::ProjectSpec, String> {
+    let mut docs = Vec::new();
+    if !no_user_base
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        && let Ok(t) = std::fs::read_to_string(std::path::Path::new(&home).join(".sbxenv.yaml"))
+    {
+        docs.push(t);
+    }
+    docs.push(std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?);
+    let dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let dir = state::plain_path(&std::fs::canonicalize(dir).map_err(|e| e.to_string())?)
+        .to_string_lossy()
+        .into_owned();
+    let args = compose::parse_kv_args(env_args, "--env-arg")?;
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    osbx_env::compile(
+        &refs,
+        &osbx_env::Context {
+            project_dir: dir.clone(),
+            file_dir: dir,
+            args,
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn env_check(file: &std::path::Path, env_args: &[String], no_user_base: bool) -> ExitCode {
-    let run = || -> Result<String, String> {
-        let mut docs = Vec::new();
-        if !no_user_base
-            && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-            && let Ok(t) = std::fs::read_to_string(std::path::Path::new(&home).join(".sbxenv.yaml"))
-        {
-            docs.push(t);
+    match load_env_spec(file, env_args, no_user_base) {
+        Ok(project) => {
+            print!("{}", compose::format_plan(&project, &[]));
+            ExitCode::SUCCESS
         }
-        docs.push(std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?);
-        let dir = file
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
-        let dir = state::plain_path(&std::fs::canonicalize(dir).map_err(|e| e.to_string())?)
-            .to_string_lossy()
-            .into_owned();
-        let mut args = std::collections::BTreeMap::new();
-        for a in env_args {
-            let (k, v) = a
-                .split_once('=')
-                .ok_or(format!("--env-arg {a:?}: expected name=value"))?;
-            args.insert(k.to_owned(), v.to_owned());
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
-        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
-        let e = osbx_env::load(
-            &refs,
-            &osbx_env::Context {
-                project_dir: dir.clone(),
-                file_dir: dir,
-                args,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        let mut out = format!(
-            "agent: {}\nname: {}\n",
-            e.agent,
-            e.name.as_deref().unwrap_or("(default)")
-        );
-        for k in &e.kits {
-            out += &format!(
-                "kit: {} -> handle {:?} ({:?})\n",
-                k.source(),
-                k.handle(),
-                k.kind()
-            );
+    }
+}
+
+fn env_config(
+    file: &std::path::Path,
+    env_args: &[String],
+    no_user_base: bool,
+    json: bool,
+) -> ExitCode {
+    match load_env_spec(file, env_args, no_user_base).and_then(|p| compose::format_config(&p, json))
+    {
+        Ok(s) => {
+            print!("{s}");
+            ExitCode::SUCCESS
         }
-        for (sandbox, host) in &e.mounts {
-            out += &format!("mount: {sandbox} <- {host}\n");
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
-        for (n, s) in &e.secrets {
-            if s.is_literal() {
-                out += &format!(
-                    "WARNING: secret {n:?} embeds a literal value; use ref: or command:\n"
-                );
-            }
+    }
+}
+
+fn compose_plan(opts: &ComposeGlobalArgs) -> ExitCode {
+    match compose::load(&opts.files, &opts.args, opts.no_user_base) {
+        Ok(loaded) => {
+            print!("{}", compose::format_plan(&loaded.project, &opts.profiles));
+            ExitCode::SUCCESS
         }
-        if !e.lifecycle.initialize.is_empty()
-            || !e.lifecycle.post_create.is_empty()
-            || !e.lifecycle.pre_remove.is_empty()
-        {
-            out += "NOTE: lifecycle hooks run on the host with your privileges\n";
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
-        Ok(out)
-    };
-    match run() {
+    }
+}
+
+fn compose_config(opts: &ComposeGlobalArgs, json: bool) -> ExitCode {
+    match compose::load(&opts.files, &opts.args, opts.no_user_base)
+        .and_then(|loaded| compose::format_config(&loaded.project, json))
+    {
         Ok(s) => {
             print!("{s}");
             ExitCode::SUCCESS

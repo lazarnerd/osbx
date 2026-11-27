@@ -1,0 +1,14 @@
+[package]
+name = "osbx-spec"
+description = "Canonical internal verbose sandbox specification IR shared by osbx-env and osbx-compose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+osbx-policy.workspace = true
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

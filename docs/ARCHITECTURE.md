@@ -46,10 +46,14 @@ flowchart TD
     secrets["osbx-secrets<br/>stores, resolver, inject rules"]
     kit["osbx-kit<br/>Kit v3 descriptors,<br/>validate, resolve, expand"]
     env["osbx-env<br/>sbxenv.yaml"]
+    compose["osbx-compose<br/>osbx-compose.yml"]
+    spec["osbx-spec<br/>canonical verbose IR"]
     proto["osbx-proto<br/>host/guest framing"]
     agent["osbx-agent<br/>in-guest PID 1<br/>static musl"]
 
-    cli --> sandbox & image & kit & env & proxy & secrets & policy & vmm & proto
+    cli --> sandbox & image & kit & env & compose & spec & proxy & secrets & policy & vmm & proto
+    env & compose --> spec
+    spec --> policy
     image --> sandbox & vmm & proto & policy & proxy
     sandbox --> vmm & proxy & policy & secrets & proto
     proxy --> policy & secrets

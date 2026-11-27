@@ -31,7 +31,7 @@ Hardware-isolated KVM &amp; WHP microVMs · Zero-NIC egress proxy · Blind crede
 | **VM** | **MicroVM isolation** | Direct-boot Linux 6.8 microVMs powered by `osbx-vmm` on Linux/KVM and native Windows Hypervisor Platform (WHP)—up to 32 vCPUs and 64 GiB RAM, booting in ~4–5 s. |
 | **NET** | **Zero-NIC policy proxy** | No virtual NIC exists inside the guest. All outbound traffic traverses `virtio-vsock` to a host-side deny-by-default proxy with live rule reloads, Layer-7 HTTP rules, and interactive approval. |
 | **KEY** | **Blind credential injection** | API keys and OAuth tokens remain on the host. The proxy swaps placeholders for real credentials on the wire—the sandbox never sees them. |
-| **KIT** | **Kit spec v3 & `sbxenv.yaml`** | Compose OCI or local kits to declare tools, network policies, credentials, persistent volumes, host mounts, SSH agent forwarding, lifecycle hooks, Docker-in-sandbox, and nested KVM (`kvm@1`). |
+| **KIT** | **Kit spec v3, `osbx-compose.yml` & `sbxenv.yaml`** | Compose OCI or local kits and declarative multi-sandbox environments with tools, firewall rules, credentials, persistent volumes, host mounts, SSH agent forwarding, lifecycle hooks, Docker-in-sandbox, and nested KVM (`kvm@1`). |
 | **GIT** | **Safe workspace modes** | Mount your project live (`direct`), hand the agent a private Git clone you can `git fetch` back (`--clone`), or launch an empty environment (`--no-workspace`). |
 | **OCI** | **No host Docker required** | Built-in OCI registry client and ext4 builder VM unpack images natively without a Docker daemon (Linux can also read local Docker images). |
 
@@ -182,7 +182,8 @@ Sandbox state lives in `$OSBX_HOME` (default `~/.local/share/osbx` on Linux, `%L
 | Command | Description |
 | :--- | :--- |
 | `osbx env run [FILE] [--env-arg k=v] [-d]` | Launch the full sandbox environment defined in an `sbxenv.yaml`. |
-| `osbx kit validate FILE...` · `osbx env check [FILE]` · `osbx policy check ...` | Offline validation for Kit v3 descriptors, `sbxenv.yaml` files, and network policies. |
+| `osbx compose [-f FILE] [--profile P] up \| run \| down \| ps \| plan \| config \| check` | Manage multi-sandbox environments defined in an `osbx-compose.yml` (see [`docs/COMPOSE_SPEC.md`](docs/COMPOSE_SPEC.md)). |
+| `osbx kit validate FILE...` · `osbx env check\|config [FILE]` · `osbx compose check\|config` · `osbx policy check ...` | Offline validation and canonical IR inspection for Kit v3 descriptors, `sbxenv.yaml`, `osbx-compose.yml`, and network policies. |
 | `osbx vmm probe [--run-guest] [--require-nested]` | Check host hypervisor readiness and nested KVM (`kvm@1`) capability. |
 | `osbx vmm boot --kernel K --initrd I` | Boot a kernel and initramfs directly with the osbx VMM. |
 
@@ -202,7 +203,9 @@ Sandbox state lives in `$OSBX_HOME` (default `~/.local/share/osbx` on Linux, `%L
 | `osbx-policy` | Network policy rules, presets, and evaluation precedence |
 | `osbx-secrets` | Credential stores, sources, OAuth handling, and injection bindings |
 | `osbx-kit` | Kit spec v3 descriptors, validation, composition, and capability selection |
-| `osbx-env` | `sbxenv.yaml` environment specification parser and planner |
+| `osbx-spec` | Canonical internal verbose sandbox specification IR shared by `osbx-env` and `osbx-compose` |
+| `osbx-compose` | Docker Compose-style `osbx-compose.yml` parser compiling to `osbx-spec` |
+| `osbx-env` | `sbxenv.yaml` environment specification parser compiling to `osbx-spec` |
 | `osbx-image` | OCI registry client and ext4 root filesystem builder |
 | `osbx-agent` · `osbx-proto` | In-guest PID 1 agent and host/guest vsock wire protocol |
 
@@ -216,7 +219,7 @@ Sandbox state lives in `$OSBX_HOME` (default `~/.local/share/osbx` on Linux, `%L
 | `scripts/` | Install and packaging scripts (`install-flatpak.sh`, `install-osbx.ps1`, `build-flatpak.sh`) |
 | `packaging/` | Self-hosted Flatpak AppStream metainfo |
 | `assets/` | Project logo and icon marks (`logo-dark`, `logo-light`, `icon` in SVG and retina PNG) |
-| `docs/` | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`STATUS.md`](docs/STATUS.md), [`PLAN.md`](docs/PLAN.md), [`PROVENANCE.md`](docs/PROVENANCE.md) |
+| `docs/` | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`COMPOSE_SPEC.md`](docs/COMPOSE_SPEC.md), [`STATUS.md`](docs/STATUS.md), [`PLAN.md`](docs/PLAN.md), [`PROVENANCE.md`](docs/PROVENANCE.md) |
 | `dev/` | Contributor dev environment (Docker `sbx` sandbox, skills); not part of the runtime |
 
 </details>
@@ -232,6 +235,7 @@ The workspace includes **138 tests** (unit, integration, and end-to-end microVM 
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — VMM, proxy, vsock protocol, and sandbox design
+- [`docs/COMPOSE_SPEC.md`](docs/COMPOSE_SPEC.md) — `osbx-compose.yml` specification and `osbx compose` CLI reference
 - [`docs/STATUS.md`](docs/STATUS.md) — Detailed breakdown of what works today and known gaps
 - [`docs/PLAN.md`](docs/PLAN.md) — Project roadmap
 - [`guest/README.md`](guest/README.md) — Building guest assets and kernel boot modes
