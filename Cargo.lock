@@ -828,7 +828,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "osbx-agent"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "libc",
  "osbx-proto",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "libc",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-env"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "regex",
  "serde",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-image"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "flate2",
  "osbx-policy",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-kit"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "regex",
  "serde",
@@ -896,11 +896,11 @@ dependencies = [
 
 [[package]]
 name = "osbx-policy"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "osbx-proto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-proxy"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-sandbox"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-secrets"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "osbx-policy",
  "serde",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "osbx-vmm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "fuse-backend-rs",
  "kvm-bindings",
