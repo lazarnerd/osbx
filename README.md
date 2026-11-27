@@ -1,17 +1,17 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
-  <img alt="osbx" src="assets/logo-dark.svg" width="320">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/lazarnerd/osbx/main/assets/logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/lazarnerd/osbx/main/assets/logo-light.png">
+  <img alt="osbx" src="https://raw.githubusercontent.com/lazarnerd/osbx/main/assets/logo-dark.png" width="320">
 </picture>
 
 ### Open-source microVM sandbox runtime for coding agents
 
 Hardware-isolated KVM &amp; WHP microVMs · Zero-NIC egress proxy · Blind credential injection · Kit spec v3
 
-[![CI](https://github.com/lazarnerd/osbx/actions/workflows/ci.yml/badge.svg)](https://github.com/lazarnerd/osbx/actions/workflows/ci.yml)
-[![Flatpak](https://github.com/lazarnerd/osbx/actions/workflows/flatpak.yml/badge.svg)](https://github.com/lazarnerd/osbx/actions/workflows/flatpak.yml)
+[![CI](https://img.shields.io/github/check-runs/lazarnerd/osbx/main?label=CI&style=flat)](https://github.com/lazarnerd/osbx/actions/workflows/ci.yml)
+[![Flatpak](https://img.shields.io/github/v/release/lazarnerd/osbx?label=flatpak&color=0ea5e9&style=flat)](https://github.com/lazarnerd/osbx/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-6366f1?style=flat)](LICENSE)
 [![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-38bdf8?style=flat)](rust-toolchain.toml)
 [![Platforms](https://img.shields.io/badge/hosts-Linux%20KVM%20%7C%20Windows%20WHP-8b5cf6?style=flat)](docs/STATUS.md)
@@ -215,7 +215,7 @@ Sandbox state lives in `$OSBX_HOME` (default `~/.local/share/osbx` on Linux, `%L
 | `third_party/vm-memory/` | Patched `vm-memory` (see [`OSBX-PATCH.md`](third_party/vm-memory/OSBX-PATCH.md)) |
 | `scripts/` | Install and packaging scripts (`install-flatpak.sh`, `install-osbx.ps1`, `build-flatpak.sh`) |
 | `packaging/` | Self-hosted Flatpak AppStream metainfo |
-| `assets/` | Project vector logo and icon marks (`logo-dark.svg`, `logo-light.svg`, `icon.svg`) |
+| `assets/` | Project logo and icon marks (`logo-dark`, `logo-light`, `icon` in SVG and retina PNG) |
 | `docs/` | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`STATUS.md`](docs/STATUS.md), [`PLAN.md`](docs/PLAN.md), [`PROVENANCE.md`](docs/PROVENANCE.md) |
 | `dev/` | Contributor dev environment (Docker `sbx` sandbox, skills); not part of the runtime |
 
