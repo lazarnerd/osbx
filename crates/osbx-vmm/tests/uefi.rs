@@ -1,9 +1,9 @@
-//! Integration tests for Q35 PCIe UEFI (OVMF) boot on KVM:
+//! Integration tests for Q35 PCIe UEFI (OVMF) boot on KVM/WHP:
 //! - Unified `OVMF.fd` -> UEFI Interactive Shell -> ACPI S5 shutdown
 //! - Split `OVMF_CODE_4M.fd` + persistent CFI `pflash` `OVMF_VARS_4M.fd` + 4 GiB RAM
 //! - `virtio-blk` (PCIe QCOW2 CoW disk with FAT32) + `virtio-scsi` (PCIe ISO9660 CD-ROM)
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 
 use osbx_vmm::{DiskConfig, ExitReason, UefiConfig, boot_uefi, qcow2};
 use std::path::{Path, PathBuf};

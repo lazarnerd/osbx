@@ -53,12 +53,18 @@ pub mod pflash;
 #[cfg(any(target_os = "linux", windows))]
 pub mod qcow2;
 #[cfg(any(target_os = "linux", windows))]
+pub mod tpm;
+#[cfg(any(target_os = "linux", windows))]
+mod uefi;
+#[cfg(any(target_os = "linux", windows))]
 pub mod virtio;
 #[cfg(any(target_os = "linux", windows))]
 pub use boot::{
     BootConfig, BootError, BootOutcome, DEFAULT_CMDLINE, DiskConfig, ExitReason, ShareConfig, Vm,
     boot_linux,
 };
+#[cfg(any(target_os = "linux", windows))]
+pub use uefi::{UefiConfig, UefiOutcome, UefiVm, boot_uefi};
 
 #[cfg(target_os = "linux")]
 mod guest;
@@ -67,15 +73,11 @@ mod kvm;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-mod uefi;
-#[cfg(target_os = "linux")]
 pub use guest::run_hello_guest;
 #[cfg(target_os = "linux")]
 use kvm as hv;
 #[cfg(target_os = "linux")]
 pub use linux::probe;
-#[cfg(target_os = "linux")]
-pub use uefi::{UefiConfig, UefiOutcome, UefiVm, boot_uefi};
 
 #[cfg(windows)]
 mod whp;

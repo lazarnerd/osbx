@@ -1,62 +1,60 @@
-//! Q35 PCIe UEFI (EDK2 OVMF) virtual machine monitor on KVM.
+//! Q35 PCIe UEFI (EDK2 OVMF) virtual machine monitor on KVM (Linux) and WHP (Windows).
 //!
 //! Boots UEFI guests (Windows Server 2022/2025, Windows 11, UEFI Linux) from the x86 16-bit
 //! reset vector (`0xFFFF_FFF0`) with:
-//! - Q35 MCH (`8086:29c0`) + ICH9 LPC/PM (`8086:2918`) + PCIe ECAM (`0xB000_0000`)
+//! - Q35 MCH (`8086:29c0`) + ICH9 LPC/PM (`8086:2918`) + PCIe ECAM (`0xE000_0000`)
 //! - ACPI 2.0 tables (`RSDP`, `XSDT`, `FADT`, `MADT`, `MCFG`, `HPET`, `DSDT`) via `fw_cfg`
-//! - Persistent CFI `pflash` for `OVMF_VARS_4M.fd` + `KVM_MEM_READONLY` `OVMF_CODE_4M.fd`
-//! - Bochs VBE PCI display (`1234:1111`, 16 MiB linear framebuffer) for UEFI GOP
-//! - Modern Virtio 1.0 `virtio-pci` devices (`Block` raw/QCOW2, `VirtioScsi` CD-ROM, `Vsock`)
-//!   with KVM MSI-X routing (`KVM_SET_GSI_ROUTING` + `irqfd`)
-//! - KVM Hyper-V enlightenments (`hv_relaxed`, `hv_vapic`, `hv_vpindex`, `hv_time`, `hv_synic`,
+//! - Persistent CFI `pflash` for `OVMF_VARS_4M.fd` + read-only `OVMF_CODE_4M.fd`
+//! - Bochs VBE PCI display (`1234:1111`, 16 MiB linear framebuffer + BAR2 MMIO regs) for UEFI GOP
+//! - ICH9 AHCI 1.3 ATAPI controller (`8086:2922` at `00:1f.2`) for ISO CD-ROMs
+//! - Modern Virtio 1.0 `virtio-pci` devices (`Block` raw/QCOW2, `Fs`, `Vsock`) with MSI-X routing
+//! - Hyper-V enlightenments (`hv_relaxed`, `hv_vapic`, `hv_vpindex`, `hv_time`, `hv_synic`,
 //!   `hv_stimer`, `hv_runtime`, `hv_reset`, `hv_tlbflush`)
 
+#[cfg(target_os = "linux")]
+mod kvm;
+#[cfg(target_os = "linux")]
+use kvm as backend;
+
+#[cfg(windows)]
+mod whp;
+#[cfg(windows)]
+use whp as backend;
+
 use crate::acpi;
-use crate::boot::{BootConfig, BootError, DiskConfig, ExitReason, cpuid_topology, err};
+use crate::boot::{BootConfig, BootError, DiskConfig, ExitReason, ShareConfig, err};
 use crate::devices::{COM1, COM1_IRQ, Sink, Uart, UartIrq};
 use crate::hpet::{HPET_BASE, HPET_SIZE, Hpet};
-use crate::irq::{Irq, IrqLine};
+use crate::ioapic::{IOAPIC_SIZE, IoApic};
+use crate::mptable::IOAPIC_ADDR;
+use crate::pci::PciBus;
 use crate::pci::ahci::{AHCI_BAR5_SIZE, AhciController};
 use crate::pci::vga::{
     BochsVga, VBE_DISPI_DATA_PORT, VBE_DISPI_INDEX_PORT, VGA_FB_SIZE, VGA_MMIO_SIZE, VbeState,
 };
 use crate::pci::virtio_pci::{VIRTIO_BAR0_SIZE, VIRTIO_BAR2_SIZE, VirtioPciTransport};
-use crate::pci::{MsiRouter, PciBus};
 use crate::pflash::Pflash;
+use crate::tpm::{TPM_CRB_BASE, TPM_CRB_SIZE, Tpm2Crb};
 use crate::virtio::blk::Block;
+use crate::virtio::fs::Fs;
 use crate::virtio::vsock::{VsockHost, vsock};
 use crate::virtio::{GuestMem, VirtioDevice};
-use kvm_bindings::{
-    KVM_CAP_HYPERV_SYNIC2, KVM_EXIT_HYPERV_HCALL, KVM_EXIT_HYPERV_SYNDBG, KVM_EXIT_HYPERV_SYNIC,
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
-    KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES, KVM_MEM_READONLY, KVM_PIT_SPEAKER_DUMMY,
-    KVM_SYSTEM_EVENT_SHUTDOWN, KvmIrqRouting, Msrs, kvm_enable_cap, kvm_fpu, kvm_irq_routing_entry,
-    kvm_msr_entry, kvm_pit_config, kvm_userspace_memory_region,
-};
-use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::io::{self, Write};
-use std::os::unix::thread::JoinHandleExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use vm_superio::Serial;
-use vmm_sys_util::eventfd::EventFd;
 
 /// 4 GiB boundary; firmware ROM is mapped ending right below this address.
 const FOUR_GIB: u64 = 1u64 << 32;
-/// Top of low RAM on Q35 (2 GiB), leaving `0xB000_0000` for PCIe ECAM and `0xC000_0000` for PCI MMIO.
+/// Top of low RAM on Q35 (2 GiB), leaving `0x8000_0000..0xE000_0000` for PCI MMIO and `0xE000_0000` for ECAM.
 const UEFI_LOW_MEM_END: u64 = 0x8000_0000;
-/// KVM TSS and identity-map addresses kept below IOAPIC (`0xFEC0_0000`) and flash (`0xFFC0_0000`).
-const UEFI_KVM_TSS_ADDR: u64 = 0xfeb0_0000;
-const UEFI_KVM_IDENTITY_MAP_ADDR: u64 = 0xfeb0_4000;
-/// Dedicated KVM memory slot for Bochs VGA 16 MiB linear framebuffer.
-const VGA_FB_KVM_SLOT: u32 = 10;
 /// ACPI PM timer frequency (3.579545 MHz).
 const ACPI_PM_TIMER_HZ: u128 = 3_579_545;
 
-/// Configuration for booting a Q35 PCIe UEFI (OVMF) VM on KVM.
+/// Configuration for booting a Q35 PCIe UEFI (OVMF) VM.
 #[derive(Debug, Clone)]
 pub struct UefiConfig {
     /// Path to `OVMF.fd` (unified 4 MiB) or `OVMF_CODE_4M.fd` (when `vars` is set).
@@ -77,12 +75,16 @@ pub struct UefiConfig {
     pub stdin: bool,
     /// Disks attached via `virtio-blk` (PCIe, raw or QCOW2).
     pub disks: Vec<DiskConfig>,
-    /// Read-only ISO CD-ROMs attached via `virtio-scsi` (PCIe, targets `0..cdroms.len()`).
+    /// Read-only ISO CD-ROMs attached via ICH9 AHCI ATAPI (`00:1f.2`, ports `0..cdroms.len()`).
     pub cdroms: Vec<PathBuf>,
+    /// Host directories shared over `virtio-fs` (PCIe).
+    pub shares: Vec<ShareConfig>,
     /// Attach a `virtio-vsock` (PCIe) device with this guest CID (3 is conventional).
     pub vsock_cid: Option<u64>,
-    /// Expose KVM Hyper-V enlightenments (`hv_relaxed`, `hv_time`, `hv_synic`, `hv_stimer`, etc.).
+    /// Expose Hyper-V enlightenments (`hv_relaxed`, `hv_time`, `hv_synic`, `hv_stimer`, etc.).
     pub hyperv: bool,
+    /// Optional persistent state file for an emulated CRB vTPM 2.0 device at `0xFED4_0000`.
+    pub vtpm: Option<PathBuf>,
     /// Optional trigger + bytes to inject into COM1 once `trigger` appears in serial output.
     pub send_on_match: Option<(String, Vec<u8>)>,
 }
@@ -101,8 +103,10 @@ impl UefiConfig {
             stdin: false,
             disks: Vec::new(),
             cdroms: Vec::new(),
+            shares: Vec::new(),
             vsock_cid: None,
             hyperv: true,
+            vtpm: None,
             send_on_match: None,
         }
     }
@@ -121,142 +125,31 @@ pub struct UefiOutcome {
     pub powered_off: bool,
 }
 
-struct EventFdLine(EventFd);
-impl IrqLine for EventFdLine {
-    fn pulse(&self) {
-        let _ = self.0.write(1);
-    }
+/// Page-aligned backing store for the Bochs VGA 16 MiB linear framebuffer memory slot.
+pub(super) struct FbBuffer {
+    buf: Vec<u8>,
+    offset: usize,
+    len: usize,
 }
 
-/// KVM MSI-X router backed by `KVM_SET_GSI_ROUTING` + per-vector `EventFd` (`KVM_IRQFD`).
-struct KvmMsiRouter {
-    vm: Arc<VmFd>,
-    state: Mutex<MsiRouterState>,
-}
-
-struct MsiEntry {
-    gsi: u32,
-    evt: EventFd,
-    addr: u64,
-    data: u32,
-    configured: bool,
-}
-
-struct MsiRouterState {
-    next_gsi: u32,
-    entries: Vec<MsiEntry>,
-}
-
-impl KvmMsiRouter {
-    fn new(vm: Arc<VmFd>) -> Self {
-        Self {
-            vm,
-            state: Mutex::new(MsiRouterState {
-                next_gsi: 24, // 0..24 are reserved for PIC/IOAPIC
-                entries: Vec::new(),
-            }),
-        }
+impl FbBuffer {
+    fn new(len: usize) -> Self {
+        let buf = vec![0u8; len + 4096];
+        let addr = buf.as_ptr() as usize;
+        let offset = (4096 - (addr % 4096)) % 4096;
+        Self { buf, offset, len }
     }
 
-    fn rebuild_routing(&self, entries: &[MsiEntry]) -> io::Result<()> {
-        // Base legacy PIC (0..16) + IOAPIC (0..24) routes + active MSI routes.
-        let mut raw_entries: Vec<kvm_irq_routing_entry> = Vec::new();
-        for pin in 0u32..16 {
-            let (chip, chip_pin) = if pin < 8 {
-                (KVM_IRQCHIP_PIC_MASTER, pin)
-            } else {
-                (KVM_IRQCHIP_PIC_SLAVE, pin - 8)
-            };
-            let mut e = kvm_irq_routing_entry {
-                gsi: pin,
-                type_: KVM_IRQ_ROUTING_IRQCHIP,
-                flags: 0,
-                ..Default::default()
-            };
-            e.u.irqchip.irqchip = chip;
-            e.u.irqchip.pin = chip_pin;
-            raw_entries.push(e);
-        }
-        for pin in 0u32..24 {
-            let mut e = kvm_irq_routing_entry {
-                gsi: pin,
-                type_: KVM_IRQ_ROUTING_IRQCHIP,
-                flags: 0,
-                ..Default::default()
-            };
-            e.u.irqchip.irqchip = KVM_IRQCHIP_IOAPIC;
-            e.u.irqchip.pin = pin;
-            raw_entries.push(e);
-        }
-        for m in entries {
-            if !m.configured {
-                continue;
-            }
-            let mut e = kvm_irq_routing_entry {
-                gsi: m.gsi,
-                type_: KVM_IRQ_ROUTING_MSI,
-                flags: 0,
-                ..Default::default()
-            };
-            e.u.msi.address_lo = m.addr as u32;
-            e.u.msi.address_hi = (m.addr >> 32) as u32;
-            e.u.msi.data = m.data;
-            raw_entries.push(e);
-        }
-
-        let mut routing = KvmIrqRouting::new(raw_entries.len()).map_err(io::Error::other)?;
-        routing.as_mut_slice().copy_from_slice(&raw_entries);
-        self.vm
-            .set_gsi_routing(&routing)
-            .map_err(|e| io::Error::other(format!("KVM_SET_GSI_ROUTING: {e}")))
-    }
-}
-
-impl MsiRouter for KvmMsiRouter {
-    fn allocate(&self) -> io::Result<u32> {
-        let mut st = self.state.lock().unwrap();
-        let gsi = st.next_gsi;
-        st.next_gsi += 1;
-        let evt = EventFd::new(0)?;
-        self.vm
-            .register_irqfd(&evt, gsi)
-            .map_err(|e| io::Error::other(format!("KVM_IRQFD(msi {gsi}): {e}")))?;
-        let handle = st.entries.len() as u32;
-        st.entries.push(MsiEntry {
-            gsi,
-            evt,
-            addr: 0,
-            data: 0,
-            configured: false,
-        });
-        Ok(handle)
+    pub(super) fn as_ptr(&self) -> *const u8 {
+        self.buf[self.offset..].as_ptr()
     }
 
-    fn configure(&self, handle: u32, addr: u64, data: u32) -> io::Result<()> {
-        let mut st = self.state.lock().unwrap();
-        let Some(entry) = st.entries.get_mut(handle as usize) else {
-            return Ok(());
-        };
-        if entry.configured && entry.addr == addr && entry.data == data {
-            return Ok(());
-        }
-        entry.addr = addr;
-        entry.data = data;
-        entry.configured = true;
-        let res = self.rebuild_routing(&st.entries);
-        if let Err(ref e) = res {
-            eprintln!(
-                "[osbx-vmm] KVM_SET_GSI_ROUTING failed (h={handle}, addr={addr:#x}, data={data:#x}): {e}"
-            );
-        }
-        res
+    pub(super) fn len(&self) -> usize {
+        self.len
     }
 
-    fn trigger(&self, handle: u32) {
-        let st = self.state.lock().unwrap();
-        if let Some(entry) = st.entries.get(handle as usize) {
-            let _ = entry.evt.write(1);
-        }
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[self.offset..self.offset + self.len]
     }
 }
 
@@ -353,7 +246,6 @@ impl FwCfg {
             e820.extend_from_slice(&ty.to_le_bytes());
         };
         push_e820(0, low_mem, 1);
-        // Reserve PCIe ECAM window (`0xB000_0000..0xC000_0000`)
         push_e820(crate::pci::PCIE_ECAM_BASE, crate::pci::PCIE_ECAM_SIZE, 2);
         if high_mem > 0 {
             push_e820(FOUR_GIB, high_mem, 1);
@@ -461,7 +353,7 @@ impl FwCfg {
     }
 }
 
-struct UefiDevices {
+pub(super) struct UefiDevices {
     uart: Arc<Mutex<Uart>>,
     debugcon: Arc<Mutex<Vec<u8>>>,
     echo_debugcon: bool,
@@ -469,6 +361,8 @@ struct UefiDevices {
     vbe: Arc<Mutex<VbeState>>,
     hpet: Hpet,
     pflash: Option<Pflash>,
+    ioapic: Option<Arc<IoApic>>,
+    tpm: Option<Mutex<Tpm2Crb>>,
     cmos: Mutex<UefiCmos>,
     fw_cfg: Mutex<FwCfg>,
     mem: GuestMem,
@@ -481,12 +375,17 @@ struct UefiDevices {
 }
 
 impl UefiDevices {
+    #[cfg(target_os = "linux")]
+    pub(super) fn mark_powered_off(&self) {
+        self.powered_off.store(true, Ordering::SeqCst);
+    }
+
     fn pm_timer_ticks(&self) -> u32 {
         let ns = self.boot_instant.elapsed().as_nanos();
         ((ns * ACPI_PM_TIMER_HZ) / 1_000_000_000) as u32 & 0x00ff_ffff
     }
 
-    fn io_out(&self, port: u16, data: &[u8]) -> Option<ExitReason> {
+    pub(super) fn io_out(&self, port: u16, data: &[u8]) -> Option<ExitReason> {
         if let Some(pm_base) = self.pci.lock().unwrap().pm_base()
             && port >= pm_base
             && port < pm_base.saturating_add(0x80)
@@ -574,7 +473,7 @@ impl UefiDevices {
         None
     }
 
-    fn io_in(&self, port: u16, data: &mut [u8]) {
+    pub(super) fn io_in(&self, port: u16, data: &mut [u8]) {
         if let Some(pm_base) = self.pci.lock().unwrap().pm_base()
             && port >= pm_base
             && port < pm_base.saturating_add(0x80)
@@ -646,7 +545,7 @@ impl UefiDevices {
         }
     }
 
-    fn mmio_read(&self, addr: u64, data: &mut [u8]) {
+    pub(super) fn mmio_read(&self, addr: u64, data: &mut [u8]) {
         if let Some(pf) = &self.pflash
             && pf.contains(addr)
         {
@@ -657,12 +556,25 @@ impl UefiDevices {
             self.hpet.read(addr - HPET_BASE, data);
             return;
         }
+        let ioapic_base = u64::from(IOAPIC_ADDR);
+        if let Some(ioapic) = &self.ioapic
+            && (ioapic_base..ioapic_base + IOAPIC_SIZE).contains(&addr)
+        {
+            ioapic.read(addr - ioapic_base, data);
+            return;
+        }
+        if let Some(tpm) = &self.tpm
+            && (TPM_CRB_BASE..TPM_CRB_BASE + TPM_CRB_SIZE).contains(&addr)
+        {
+            tpm.lock().unwrap().read(addr - TPM_CRB_BASE, data);
+            return;
+        }
         if !self.pci.lock().unwrap().mmio_read(addr, data) {
             data.fill(0xff);
         }
     }
 
-    fn mmio_write(&self, addr: u64, data: &[u8]) {
+    pub(super) fn mmio_write(&self, addr: u64, data: &[u8]) {
         if let Some(pf) = &self.pflash
             && pf.contains(addr)
         {
@@ -673,36 +585,26 @@ impl UefiDevices {
             self.hpet.write(addr - HPET_BASE, data);
             return;
         }
+        let ioapic_base = u64::from(IOAPIC_ADDR);
+        if let Some(ioapic) = &self.ioapic
+            && (ioapic_base..ioapic_base + IOAPIC_SIZE).contains(&addr)
+        {
+            ioapic.write(addr - ioapic_base, data);
+            return;
+        }
+        if let Some(tpm) = &self.tpm
+            && (TPM_CRB_BASE..TPM_CRB_BASE + TPM_CRB_SIZE).contains(&addr)
+        {
+            tpm.lock().unwrap().write(addr - TPM_CRB_BASE, data);
+            return;
+        }
         self.pci.lock().unwrap().mmio_write(addr, data);
     }
 }
 
-/// Page-aligned backing store for the Bochs VGA 16 MiB linear framebuffer KVM slot.
-struct FbBuffer {
-    buf: Vec<u8>,
-    offset: usize,
-    len: usize,
-}
-
-impl FbBuffer {
-    fn new(len: usize) -> Self {
-        let buf = vec![0u8; len + 4096];
-        let addr = buf.as_ptr() as usize;
-        let offset = (4096 - (addr % 4096)) % 4096;
-        Self { buf, offset, len }
-    }
-
-    fn as_ptr(&self) -> *const u8 {
-        self.buf[self.offset..].as_ptr()
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        &self.buf[self.offset..self.offset + self.len]
-    }
-}
-
-/// A running Q35 PCIe UEFI virtual machine on KVM.
+/// A running Q35 PCIe UEFI virtual machine (Linux/KVM or Windows/WHP).
 pub struct UefiVm {
+    machine: Arc<backend::UefiMachine>,
     vsock: Option<VsockHost>,
     uart: Arc<Mutex<Uart>>,
     captured: Arc<Mutex<Vec<u8>>>,
@@ -771,28 +673,14 @@ impl UefiVm {
         mem.write_slice(&code_bytes, GuestAddress(code_base))
             .map_err(err("load firmware"))?;
 
-        let kvm = Kvm::new().map_err(err("open /dev/kvm"))?;
-        let vm = Arc::new(kvm.create_vm().map_err(err("KVM_CREATE_VM"))?);
-        map_uefi_memory(&vm, &mem, code_base, code_readonly)?;
-        vm.set_tss_address(UEFI_KVM_TSS_ADDR as usize)
-            .map_err(err("KVM_SET_TSS_ADDR"))?;
-        vm.set_identity_map_address(UEFI_KVM_IDENTITY_MAP_ADDR)
-            .map_err(err("KVM_SET_IDENTITY_MAP_ADDR"))?;
-        vm.create_irq_chip().map_err(err("KVM_CREATE_IRQCHIP"))?;
-        vm.create_pit2(kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        })
-        .map_err(err("KVM_CREATE_PIT2"))?;
-        install_kick_handler();
-
-        let make_irq = |gsi: u32| -> Result<Irq, BootError> {
-            let evt = EventFd::new(0).map_err(err("eventfd"))?;
-            vm.register_irqfd(&evt, gsi).map_err(err("KVM_IRQFD"))?;
-            Ok(Arc::new(EventFdLine(evt)))
-        };
-
-        let msi_router: Arc<dyn MsiRouter> = Arc::new(KvmMsiRouter::new(vm.clone()));
+        let machine = Arc::new(backend::UefiMachine::new(
+            &mem,
+            cfg.cpus,
+            code_base,
+            code_readonly,
+            cfg.hyperv,
+        )?);
+        let msi_router = machine.msi_router();
         let mut pci = PciBus::new();
 
         // Slot 00:01.0: Bochs VBE GOP framebuffer (BAR0 16 MiB linear FB, BAR2 4 KiB MMIO regs)
@@ -803,7 +691,7 @@ impl UefiVm {
         let fb_bar2 = pci
             .alloc_mmio32(VGA_MMIO_SIZE)
             .ok_or_else(|| BootError("out of PCI MMIO32 for VGA BAR2".into()))?;
-        let fb_mapper = make_fb_mapper(vm.clone(), fb_mem.clone());
+        let fb_mapper = machine.fb_mapper(fb_mem.clone());
         let (vga_dev, vbe) = BochsVga::new(fb_bar0, fb_bar2, fb_mapper);
         pci.add_device(1, 0, Arc::new(Mutex::new(vga_dev)));
 
@@ -819,7 +707,7 @@ impl UefiVm {
             let bar2 = pci
                 .alloc_mmio32(VIRTIO_BAR2_SIZE)
                 .ok_or_else(|| BootError("out of PCI MMIO32 for virtio BAR2".into()))?;
-            let intx = make_irq(gsi)?;
+            let intx = machine.make_irq(gsi)?;
             let transport = VirtioPciTransport::new(
                 dev,
                 mem.clone(),
@@ -837,6 +725,11 @@ impl UefiVm {
             let blk = Block::open(&disk.path, disk.read_only)
                 .map_err(|e| BootError(format!("open disk {}: {e}", disk.path.display())))?;
             attach_virtio(Box::new(blk))?;
+        }
+        for share in &cfg.shares {
+            let fs = Fs::new(&share.tag, &share.host_dir, share.read_only)
+                .map_err(|e| BootError(format!("open share {:?}: {e}", share.tag)))?;
+            attach_virtio(Box::new(fs))?;
         }
         let mut vsock_host = None;
         if let Some(cid) = cfg.vsock_cid {
@@ -856,7 +749,7 @@ impl UefiVm {
                 mem.clone(),
                 ahci_bar5,
                 ahci_gsi as u8,
-                make_irq(ahci_gsi)?,
+                machine.make_irq(ahci_gsi)?,
                 msi_router.clone(),
             )
             .map_err(|e| BootError(format!("open AHCI cdroms: {e}")))?;
@@ -867,11 +760,16 @@ impl UefiVm {
         let acpi_blobs = acpi::build(
             cfg.cpus,
             Some((pci_mmio64_base, pci_mmio64_base + (2 << 30))),
+            cfg.vtpm.is_some(),
         );
+        let tpm = cfg
+            .vtpm
+            .as_deref()
+            .map(|p| Mutex::new(Tpm2Crb::open(Some(p))));
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let uart: Arc<Mutex<Uart>> = Arc::new(Mutex::new(Serial::new(
-            UartIrq(make_irq(COM1_IRQ)?),
+            UartIrq(machine.make_irq(COM1_IRQ)?),
             Sink {
                 captured: captured.clone(),
                 echo: cfg.echo,
@@ -888,6 +786,8 @@ impl UefiVm {
             vbe: vbe.clone(),
             hpet: Hpet::new(),
             pflash,
+            ioapic: machine.ioapic(),
+            tpm,
             cmos: Mutex::new(UefiCmos::new(low_mem, high_mem, cfg.cpus)),
             fw_cfg: Mutex::new(FwCfg::new(low_mem, high_mem, cfg.cpus, acpi_blobs)),
             mem: mem.clone(),
@@ -901,10 +801,7 @@ impl UefiVm {
 
         let mut vcpus = Vec::with_capacity(cfg.cpus as usize);
         for id in 0..cfg.cpus {
-            let mut vcpu = vm
-                .create_vcpu(u64::from(id))
-                .map_err(err("KVM_CREATE_VCPU"))?;
-            setup_uefi_vcpu(&kvm, &mut vcpu, id, cfg.cpus, cfg.hyperv)?;
+            let vcpu = machine.create_vcpu(id, cfg.cpus, cfg.hyperv)?;
             vcpus.push(vcpu);
         }
 
@@ -940,14 +837,14 @@ impl UefiVm {
         }
 
         let (tx, rx) = mpsc::channel();
-        let keep = Arc::new((vm, mem, fb_mem.clone()));
+        let keep = Arc::new((machine.clone(), mem, fb_mem.clone()));
         let threads = vcpus
             .into_iter()
             .map(|mut vcpu| {
                 let (stop, tx, devices, keep) =
                     (stop.clone(), tx.clone(), devices.clone(), keep.clone());
                 std::thread::spawn(move || {
-                    let r = run_uefi_vcpu(&mut vcpu, &devices, &stop).map_err(|e| e.0);
+                    let r = vcpu.run(&devices, &stop).map_err(|e| e.0);
                     let _ = tx.send(r);
                     drop(vcpu);
                     drop(keep);
@@ -958,6 +855,7 @@ impl UefiVm {
         drop(keep);
 
         Ok(Self {
+            machine,
             vsock: vsock_host,
             uart,
             captured,
@@ -1016,8 +914,8 @@ impl UefiVm {
     }
 
     fn kick_all(&self) {
-        for t in self.threads.lock().unwrap().iter() {
-            kick_thread(t);
+        for (i, t) in self.threads.lock().unwrap().iter().enumerate() {
+            self.machine.kick(i, t);
         }
     }
 
@@ -1095,48 +993,6 @@ pub fn boot_uefi(cfg: &UefiConfig) -> Result<UefiOutcome, BootError> {
 #[allow(dead_code)]
 fn _assert_types(_: &BootConfig) {}
 
-#[allow(unsafe_code)]
-fn make_fb_mapper(vm: Arc<VmFd>, fb_mem: Arc<Mutex<FbBuffer>>) -> crate::pci::vga::BarMapper {
-    let current = Mutex::new(None::<u64>);
-    Arc::new(move |new_gpa: Option<u64>| {
-        let mut cur = current.lock().unwrap();
-        if *cur == new_gpa {
-            return;
-        }
-        let guard = fb_mem.lock().unwrap();
-        let host_ptr = guard.as_ptr() as u64;
-        if let Some(old) = *cur {
-            let unmap = kvm_userspace_memory_region {
-                slot: VGA_FB_KVM_SLOT,
-                flags: 0,
-                guest_phys_addr: old,
-                memory_size: 0,
-                userspace_addr: host_ptr,
-            };
-            // SAFETY: unmapping slot VGA_FB_KVM_SLOT with memory_size = 0.
-            let _ = unsafe { vm.set_user_memory_region(unmap) };
-        }
-        if let Some(gpa) = new_gpa {
-            let map = kvm_userspace_memory_region {
-                slot: VGA_FB_KVM_SLOT,
-                flags: 0,
-                guest_phys_addr: gpa,
-                memory_size: guard.len as u64,
-                userspace_addr: host_ptr,
-            };
-            // SAFETY: `fb_mem` is page-aligned, kept alive in `keep` for the entire lifetime of
-            // the VM, and never reallocated after creation.
-            if let Err(e) = unsafe { vm.set_user_memory_region(map) } {
-                eprintln!("[osbx-vmm] warning: failed to map VGA framebuffer at {gpa:#x}: {e}");
-            } else {
-                *cur = Some(gpa);
-                return;
-            }
-        }
-        *cur = None;
-    })
-}
-
 fn enqueue_uart(uart: &Arc<Mutex<Uart>>, mut pending: &[u8]) {
     while !pending.is_empty() {
         let mut u = uart.lock().unwrap();
@@ -1147,229 +1003,5 @@ fn enqueue_uart(uart: &Arc<Mutex<Uart>>, mut pending: &[u8]) {
         }
         drop(u);
         std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-#[allow(unsafe_code)]
-fn map_uefi_memory(
-    vm: &VmFd,
-    mem: &GuestMem,
-    code_base: u64,
-    code_readonly: bool,
-) -> Result<(), BootError> {
-    for (slot, region) in mem.iter().enumerate() {
-        let host = mem
-            .get_host_address(region.start_addr())
-            .map_err(err("host address"))?;
-        let gpa = region.start_addr().raw_value();
-        let flags = if code_readonly && gpa == code_base {
-            KVM_MEM_READONLY
-        } else {
-            0
-        };
-        let r = kvm_userspace_memory_region {
-            slot: slot as u32,
-            flags,
-            guest_phys_addr: gpa,
-            memory_size: region.len(),
-            userspace_addr: host as u64,
-        };
-        // SAFETY: `host` points at `region.len()` bytes owned by `mem`, kept alive by `keep`
-        // until every vCPU thread exits and drops its handle.
-        unsafe { vm.set_user_memory_region(r) }.map_err(err("KVM_SET_USER_MEMORY_REGION"))?;
-    }
-    Ok(())
-}
-
-fn setup_uefi_vcpu(
-    kvm: &Kvm,
-    vcpu: &mut VcpuFd,
-    id: u8,
-    cpus: u8,
-    hyperv: bool,
-) -> Result<(), BootError> {
-    let mut cpuid = kvm
-        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
-        .map_err(err("KVM_GET_SUPPORTED_CPUID"))?;
-    for e in cpuid.as_mut_slice() {
-        let mut r = [e.eax, e.ebx, e.ecx, e.edx];
-        cpuid_topology(e.function, e.index, &mut r, id, cpus);
-        [e.eax, e.ebx, e.ecx, e.edx] = r;
-    }
-
-    if hyperv {
-        // Enable KVM Hyper-V SynIC2 if supported by the host kernel.
-        let cap = kvm_enable_cap {
-            cap: KVM_CAP_HYPERV_SYNIC2,
-            ..Default::default()
-        };
-        let synic_ok = vcpu.enable_cap(&cap).is_ok();
-
-        // Relocate KVM's own hypervisor leaves from 0x4000_0000 to 0x4000_0100 so both
-        // Windows (Hyper-V TLFS at 0x4000_0000) and Linux (KVM at 0x4000_0100) detect their
-        // paravirtualization interfaces cleanly.
-        let mut merged: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid
-            .as_slice()
-            .iter()
-            .copied()
-            .map(|mut e| {
-                if (0x4000_0000..0x4000_0100).contains(&e.function) {
-                    e.function += 0x100;
-                    if e.function == 0x4000_0100 && e.eax >= 0x4000_0000 {
-                        e.eax += 0x100;
-                    }
-                }
-                e
-            })
-            .collect();
-
-        // Hyper-V TLFS CPUID leaves (0x4000_0000..=0x4000_0005), supported natively by KVM.
-        let mut hv_features: u32 = (1 << 0)  // HV_MSR_VP_RUNTIME_AVAILABLE
-            | (1 << 1)  // HV_MSR_TIME_REF_COUNT_AVAILABLE
-            | (1 << 4)  // HV_MSR_APIC_ACCESS_AVAILABLE
-            | (1 << 5)  // HV_MSR_HYPERCALL_AVAILABLE
-            | (1 << 6)  // HV_MSR_VP_INDEX_AVAILABLE
-            | (1 << 7)  // HV_MSR_RESET_AVAILABLE
-            | (1 << 9)  // HV_MSR_REFERENCE_TSC_AVAILABLE
-            | (1 << 11); // HV_ACCESS_FREQUENCY_MSRS
-        if synic_ok {
-            hv_features |= (1 << 2) | (1 << 3); // HV_MSR_SYNIC_AVAILABLE | HV_MSR_SYNTIMER_AVAILABLE
-        }
-        let hv_entry = |function: u32, eax: u32, ebx: u32, ecx: u32, edx: u32| {
-            kvm_bindings::kvm_cpuid_entry2 {
-                function,
-                index: 0,
-                flags: 0,
-                eax,
-                ebx,
-                ecx,
-                edx,
-                padding: [0; 3],
-            }
-        };
-        merged.extend_from_slice(&[
-            // 0x4000_0000: Hyper-V vendor ID ("Microsoft Hv")
-            hv_entry(
-                0x4000_0000,
-                0x4000_0005,
-                u32::from_le_bytes(*b"Micr"),
-                u32::from_le_bytes(*b"osof"),
-                u32::from_le_bytes(*b"t Hv"),
-            ),
-            // 0x4000_0001: Hyper-V interface ("Hv#1")
-            hv_entry(0x4000_0001, u32::from_le_bytes(*b"Hv#1"), 0, 0, 0),
-            // 0x4000_0002: Hyper-V version (Windows Server 2016/2025 compatible build)
-            hv_entry(0x4000_0002, 0x0000_1db1, 0x0006_0001, 0, 0),
-            // 0x4000_0003: Hyper-V feature identification (enable direct-mode stimer when SynIC ok)
-            hv_entry(
-                0x4000_0003,
-                hv_features,
-                0,
-                0,
-                if synic_ok { 1 << 19 } else { 0 },
-            ),
-            // 0x4000_0004: Implementation recommendations (relaxed timing, APIC access, TLB flush)
-            hv_entry(0x4000_0004, (1 << 2) | (1 << 3) | (1 << 5), 0x0fff, 0, 0),
-            // 0x4000_0005: Implementation limits (max VPs / logical processors)
-            hv_entry(0x4000_0005, 64, 64, 0, 0),
-        ]);
-        if let Ok(new_cpuid) = kvm_bindings::CpuId::from_entries(&merged) {
-            cpuid = new_cpuid;
-        }
-    }
-
-    vcpu.set_cpuid2(&cpuid).map_err(err("KVM_SET_CPUID2"))?;
-
-    let msrs = Msrs::from_entries(&[
-        kvm_msr_entry {
-            index: 0x1a0,
-            data: 1,
-            ..Default::default()
-        },
-        kvm_msr_entry {
-            index: 0x2ff,
-            data: (1 << 11) | 6,
-            ..Default::default()
-        },
-    ])
-    .map_err(err("msr list"))?;
-    vcpu.set_msrs(&msrs).map_err(err("KVM_SET_MSRS"))?;
-    vcpu.set_fpu(&kvm_fpu {
-        fcw: 0x37f,
-        mxcsr: 0x1f80,
-        ..Default::default()
-    })
-    .map_err(err("KVM_SET_FPU"))?;
-    Ok(())
-}
-
-fn run_uefi_vcpu(
-    vcpu: &mut VcpuFd,
-    dev: &UefiDevices,
-    stop: &AtomicBool,
-) -> Result<ExitReason, BootError> {
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return Ok(ExitReason::Timeout);
-        }
-        match vcpu.run() {
-            Ok(VcpuExit::IoOut(port, data)) => {
-                if let Some(r) = dev.io_out(port, data) {
-                    return Ok(r);
-                }
-            }
-            Ok(VcpuExit::IoIn(port, data)) => dev.io_in(port, data),
-            Ok(VcpuExit::MmioRead(addr, data)) => dev.mmio_read(addr, data),
-            Ok(VcpuExit::MmioWrite(addr, data)) => dev.mmio_write(addr, data),
-            Ok(VcpuExit::Shutdown) => return Ok(ExitReason::TripleFault),
-            Ok(VcpuExit::SystemEvent(ty, _)) => {
-                if ty == KVM_SYSTEM_EVENT_SHUTDOWN {
-                    dev.powered_off.store(true, Ordering::SeqCst);
-                }
-                return Ok(ExitReason::GuestReset);
-            }
-            Ok(VcpuExit::Hyperv) => handle_hyperv_exit(vcpu),
-            Ok(other) => return Err(BootError(format!("unhandled VM exit: {other:?}"))),
-            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {}
-            Err(e) => return Err(BootError(format!("KVM_RUN: {e}"))),
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-fn handle_hyperv_exit(vcpu: &mut VcpuFd) {
-    // SAFETY: KVM just exited with `KVM_EXIT_HYPERV`, so `kvm_run.__bindgen_anon_1.hyperv` is
-    // the active union variant populated by the kernel.
-    let hv = unsafe { &mut vcpu.get_kvm_run().__bindgen_anon_1.hyperv };
-    match hv.type_ {
-        // Guest wrote SynIC MSRs (SCONTROL/SIMP/SIEFP); KVM already updated internal state.
-        KVM_EXIT_HYPERV_SYNIC | KVM_EXIT_HYPERV_SYNDBG => {}
-        // Unhandled Hyper-V hypercall forwarded to userspace: return HV_STATUS_INVALID_HYPERCALL_CODE.
-        KVM_EXIT_HYPERV_HCALL => {
-            hv.u.hcall.result = 2;
-        }
-        _ => {}
-    }
-}
-
-extern "C" fn on_kick(_: libc::c_int) {}
-
-#[allow(unsafe_code)]
-fn install_kick_handler() {
-    // SAFETY: installs an empty, async-signal-safe SIGUSR1 handler so `kick_thread` interrupts
-    // `KVM_RUN` with EINTR without terminating the process.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_kick as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
-    }
-}
-
-#[allow(unsafe_code)]
-fn kick_thread(t: &std::thread::JoinHandle<()>) {
-    // SAFETY: `t` is a live, unjoined thread handle and SIGUSR1 has an empty handler installed.
-    unsafe {
-        libc::pthread_kill(t.as_pthread_t() as libc::pthread_t, libc::SIGUSR1);
     }
 }

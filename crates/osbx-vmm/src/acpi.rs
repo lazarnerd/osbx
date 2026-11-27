@@ -13,6 +13,7 @@
 use crate::hpet::{HPET_BASE, HPET_BLOCK_ID};
 use crate::mptable::{APIC_ADDR, IOAPIC_ADDR};
 use crate::pci::{PCI_MMIO32_BASE, PCI_MMIO32_END, PCIE_ECAM_BASE};
+use crate::tpm::{TPM_CRB_BASE, TPM_CRB_CTRL_AREA, TPM_CRB_SIZE};
 
 /// ICH9 ACPI PM I/O base advertised in FADT.
 pub const ACPI_PM_BASE: u16 = 0x0600;
@@ -37,9 +38,9 @@ pub struct AcpiBlobs {
     pub loader: Vec<u8>,
 }
 
-/// Build ACPI 2.0 tables and the `etc/table-loader` bytecode script for `cpus` vCPUs and optional
-/// 64-bit PCI MMIO window `[pci_mmio64_base, pci_mmio64_end)`.
-pub fn build(cpus: u8, pci_mmio64: Option<(u64, u64)>) -> AcpiBlobs {
+/// Build ACPI 2.0 tables and the `etc/table-loader` bytecode script for `cpus` vCPUs, optional
+/// 64-bit PCI MMIO window `[pci_mmio64_base, pci_mmio64_end)`, and optional CRB vTPM 2.0 table.
+pub fn build(cpus: u8, pci_mmio64: Option<(u64, u64)>, with_tpm: bool) -> AcpiBlobs {
     let mut tables = Vec::new();
     let mut loader = Vec::new();
 
@@ -57,7 +58,7 @@ pub fn build(cpus: u8, pci_mmio64: Option<(u64, u64)>) -> AcpiBlobs {
     // 2. DSDT
     align_vec(&mut tables, 8);
     let dsdt_off = tables.len();
-    let dsdt = build_dsdt(pci_mmio64);
+    let dsdt = build_dsdt(pci_mmio64, with_tpm);
     tables.extend_from_slice(&dsdt);
     push_checksum(&mut loader, TABLES_FILE, dsdt_off + 9, dsdt_off, dsdt.len());
 
@@ -94,15 +95,25 @@ pub fn build(cpus: u8, pci_mmio64: Option<(u64, u64)>) -> AcpiBlobs {
     tables.extend_from_slice(&hpet);
     push_checksum(&mut loader, TABLES_FILE, hpet_off + 9, hpet_off, hpet.len());
 
-    // 7. XSDT pointing to FADT, MADT, MCFG, HPET
-    align_vec(&mut tables, 8);
-    let xsdt_off = tables.len();
-    let entries = [
+    // 6b. Optional TPM2 (CRB Start Method 7)
+    let mut entries = vec![
         fadt_off as u64,
         madt_off as u64,
         mcfg_off as u64,
         hpet_off as u64,
     ];
+    if with_tpm {
+        align_vec(&mut tables, 8);
+        let tpm2_off = tables.len();
+        let tpm2 = build_tpm2();
+        tables.extend_from_slice(&tpm2);
+        push_checksum(&mut loader, TABLES_FILE, tpm2_off + 9, tpm2_off, tpm2.len());
+        entries.push(tpm2_off as u64);
+    }
+
+    // 7. XSDT pointing to FADT, MADT, MCFG, HPET (and optional TPM2)
+    align_vec(&mut tables, 8);
+    let xsdt_off = tables.len();
     let xsdt_len = 36 + entries.len() * 8;
     let mut xsdt = make_header(*b"XSDT", xsdt_len as u32, 1);
     for (i, &off) in entries.iter().enumerate() {
@@ -257,6 +268,26 @@ fn build_hpet() -> Vec<u8> {
     hdr
 }
 
+fn build_tpm2() -> Vec<u8> {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&0u16.to_le_bytes()); // PlatformClass = Client (0)
+    body.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    body.extend_from_slice(&TPM_CRB_CTRL_AREA.to_le_bytes()); // ControlAreaAddress = 0xFED4_0040
+    body.extend_from_slice(&7u32.to_le_bytes()); // StartMethod = 7 (CRB)
+
+    let mut hdr = make_header(*b"TPM2", (36 + body.len()) as u32, 4);
+    hdr.extend_from_slice(&body);
+    hdr
+}
+
+fn aml_string(s: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(2 + s.len());
+    b.push(0x0d); // StringPrefix
+    b.extend_from_slice(s.as_bytes());
+    b.push(0);
+    b
+}
+
 // --- Minimal AML builder for DSDT ---
 
 fn aml_pkg_len(body_len: usize) -> Vec<u8> {
@@ -360,7 +391,7 @@ fn eisa_id(s: &str) -> u32 {
 }
 
 /// Build the DSDT AML payload.
-fn build_dsdt(pci_mmio64: Option<(u64, u64)>) -> Vec<u8> {
+fn build_dsdt(pci_mmio64: Option<(u64, u64)>, with_tpm: bool) -> Vec<u8> {
     let mut aml = Vec::new();
 
     // Name(\_S5, Package(4) { 0, 0, 0, 0 })
@@ -467,6 +498,20 @@ fn build_dsdt(pci_mmio64: Option<(u64, u64)>) -> Vec<u8> {
     let pwrb = aml_name(b"_HID", &aml_int(u64::from(eisa_id("PNP0C0C"))));
     sb.extend_from_slice(&aml_device(b"PWRB", &pwrb));
 
+    // Optional TPM 2.0 CRB Device (MSFT0101 at 0xFED4_0000 len 0x5000)
+    if with_tpm {
+        let mut tpm = Vec::new();
+        tpm.extend_from_slice(&aml_name(b"_HID", &aml_string("MSFT0101")));
+        tpm.extend_from_slice(&aml_name(b"_UID", &aml_int(1)));
+        tpm.extend_from_slice(&aml_name(b"_STA", &aml_int(0x0f)));
+        let mut tpm_crs = vec![0x86, 0x09, 0x00, 0x01]; // Memory32Fixed, ReadWrite
+        tpm_crs.extend_from_slice(&(TPM_CRB_BASE as u32).to_le_bytes());
+        tpm_crs.extend_from_slice(&(TPM_CRB_SIZE as u32).to_le_bytes());
+        tpm_crs.extend_from_slice(&[0x79, 0x00]); // EndTag
+        tpm.extend_from_slice(&aml_name(b"_CRS", &aml_buffer(&tpm_crs)));
+        sb.extend_from_slice(&aml_device(b"TPM0", &tpm));
+    }
+
     aml.extend_from_slice(&aml_scope(b"\\_SB_", &sb));
 
     let mut hdr = make_header(*b"DSDT", (36 + aml.len()) as u32, 2);
@@ -515,10 +560,14 @@ mod tests {
 
     #[test]
     fn acpi_blobs_build_and_align() {
-        let blobs = build(4, Some((0x2_0000_0000, 0x3_0000_0000)));
+        let blobs = build(4, Some((0x2_0000_0000, 0x3_0000_0000)), false);
         assert_eq!(blobs.rsdp.len(), 36);
         assert_eq!(&blobs.rsdp[0..8], b"RSD PTR ");
         assert!(blobs.loader.len().is_multiple_of(128));
         assert!(blobs.tables.len() > 400);
+
+        let blobs_tpm = build(4, None, true);
+        assert!(blobs_tpm.tables.windows(4).any(|w| w == b"TPM2"));
+        assert!(blobs_tpm.tables.windows(8).any(|w| w == b"MSFT0101"));
     }
 }

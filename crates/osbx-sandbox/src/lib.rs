@@ -21,9 +21,7 @@ use osbx_proxy::{
     Ca, Credentials, DirectUpstream, Event, ProxyConfig, Upstream, web_pki_client_config,
 };
 use osbx_vmm::virtio::vsock::{VsockHost, VsockStream};
-use osbx_vmm::{BootConfig, DEFAULT_CMDLINE, ExitReason, Vm};
-#[cfg(target_os = "linux")]
-use osbx_vmm::{UefiConfig, UefiVm};
+use osbx_vmm::{BootConfig, DEFAULT_CMDLINE, ExitReason, UefiConfig, UefiVm, Vm};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -109,7 +107,6 @@ impl ExecOutput {
 }
 
 /// Configuration for starting a UEFI (Q35 PCIe / OVMF) sandbox (e.g., Windows guests).
-#[cfg(target_os = "linux")]
 pub struct UefiSandboxConfig {
     /// Sandbox name (scopes sandbox-specific policy rules and secrets).
     pub name: String,
@@ -119,8 +116,10 @@ pub struct UefiSandboxConfig {
     pub firmware_vars: PathBuf,
     /// Disks attached over `virtio-blk` PCIe (raw or QCOW2 CoW overlay).
     pub disks: Vec<DiskConfig>,
-    /// Optional read-only ISO CD-ROMs attached over `virtio-scsi` PCIe.
+    /// Optional read-only ISO CD-ROMs attached over `virtio-scsi` / AHCI PCIe.
     pub cdroms: Vec<PathBuf>,
+    /// Host directories shared over `virtio-fs` PCIe (`tag` derived from `guest_path`).
+    pub shares: Vec<osbx_vmm::ShareConfig>,
     /// Guest RAM in MiB.
     pub mem_mib: usize,
     /// Number of vCPUs.
@@ -139,11 +138,14 @@ pub struct UefiSandboxConfig {
     pub client_tls: Option<Arc<rustls_reexport::ClientConfig>>,
     /// Receive every policy decision.
     pub events: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    /// Forward the host SSH agent into the guest (`ssh-agent@1`), if granted.
+    pub ssh_agent: Option<ssh_agent::SshAgentConfig>,
+    /// Optional persistent state file for an emulated CRB vTPM 2.0 device (`0xFED4_0000`).
+    pub vtpm: Option<PathBuf>,
 }
 
 enum VmHandle {
     Linux(Vm),
-    #[cfg(target_os = "linux")]
     Uefi(UefiVm),
 }
 
@@ -151,35 +153,30 @@ impl VmHandle {
     fn vsock(&self) -> Option<&VsockHost> {
         match self {
             Self::Linux(v) => v.vsock(),
-            #[cfg(target_os = "linux")]
             Self::Uefi(v) => v.vsock(),
         }
     }
     fn console(&self) -> String {
         match self {
             Self::Linux(v) => v.console(),
-            #[cfg(target_os = "linux")]
             Self::Uefi(v) => v.console(),
         }
     }
     fn finished(&self) -> bool {
         match self {
             Self::Linux(v) => v.finished(),
-            #[cfg(target_os = "linux")]
             Self::Uefi(v) => v.finished(),
         }
     }
     fn wait(&self, timeout: Option<Duration>) -> Option<Result<ExitReason, osbx_vmm::BootError>> {
         match self {
             Self::Linux(v) => v.wait(timeout),
-            #[cfg(target_os = "linux")]
             Self::Uefi(v) => v.wait(timeout),
         }
     }
     fn stop(&self) -> ExitReason {
         match self {
             Self::Linux(v) => v.stop(),
-            #[cfg(target_os = "linux")]
             Self::Uefi(v) => v.stop(),
         }
     }
@@ -304,7 +301,6 @@ impl Sandbox {
     }
 
     /// Boot a Q35 PCIe UEFI guest (e.g. Windows) and serve its egress through the host proxy.
-    #[cfg(target_os = "linux")]
     pub fn start_uefi(cfg: UefiSandboxConfig) -> io::Result<Sandbox> {
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -336,8 +332,10 @@ impl Sandbox {
         uefi.cpus = cfg.cpus;
         uefi.disks = cfg.disks;
         uefi.cdroms = cfg.cdroms;
+        uefi.shares = cfg.shares;
         uefi.vsock_cid = Some(GUEST_CID);
         uefi.hyperv = true;
+        uefi.vtpm = cfg.vtpm;
         let vm = UefiVm::start(&uefi).map_err(|e| io::Error::other(e.to_string()))?;
 
         let accepted = vm.vsock().expect("vsock configured").listen(EGRESS_PORT);
@@ -347,6 +345,16 @@ impl Sandbox {
                 bridge_to_proxy(&handle, stream, proxy.clone());
             }
         });
+        if let Some(ssh_cfg) = cfg.ssh_agent {
+            let ssh_rx = vm.vsock().expect("vsock configured").listen(SSH_AGENT_PORT);
+            let ssh_cfg = Arc::new(ssh_cfg);
+            std::thread::spawn(move || {
+                while let Ok(stream) = ssh_rx.recv() {
+                    let c = ssh_cfg.clone();
+                    std::thread::spawn(move || ssh_agent::bridge(stream, &c));
+                }
+            });
+        }
 
         let mut env = cfg.env;
         let proxy_url = format!("http://{GUEST_PROXY_ADDR}");

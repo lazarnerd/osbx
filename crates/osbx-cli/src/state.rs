@@ -235,6 +235,9 @@ pub struct Record {
     /// Optional per-sandbox egress firewall (preset override + allow/deny/HTTP rules).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firewall: Option<osbx_spec::FirewallSpec>,
+    /// Attach an emulated CRB vTPM 2.0 device (`0xFED4_0000`, Windows UEFI guests).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vtpm: bool,
     /// Unix seconds.
     pub created: u64,
 }

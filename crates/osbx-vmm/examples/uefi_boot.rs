@@ -1,14 +1,14 @@
-//! Boot an EDK2 OVMF UEFI image inside `osbx-vmm` on Linux/KVM.
+//! Boot an EDK2 OVMF UEFI image inside `osbx-vmm` on Linux/KVM or Windows/WHP.
 //!
 //! `cargo run -p osbx-vmm --example uefi_boot -- [OVMF.fd] [timeout-secs] [--cdrom ISO]... [--disk IMG]... [--mem MiB] [--cpus N] [--interactive]`
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
-    eprintln!("uefi_boot example currently requires a Linux/KVM host");
+    eprintln!("uefi_boot example requires a Linux/KVM or Windows/WHP host");
     std::process::exit(1);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn main() {
     use osbx_vmm::{DiskConfig, UefiConfig, UefiVm};
     use std::path::PathBuf;

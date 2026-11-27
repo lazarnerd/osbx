@@ -1,19 +1,75 @@
 //! Windows-guest base template builder (`osbx windows build-base`).
 //!
-//! Generates an unattended Windows installation seed ISO (`autounattend.xml`, `SetupComplete.cmd`,
-//! `osbx-agent.exe`), attaches it alongside the Windows ISO and Red Hat `virtio-win.iso` over
-//! `virtio-scsi`, boots the unattended installation inside `osbx-vmm`'s Q35 PCIe UEFI VM, and
-//! seals the resulting QCOW2 base disk + persistent `OVMF_VARS_4M.fd` as a reusable template in
+//! Generates an unattended Windows installation seed ISO (`autounattend.xml`, `setup_osbx.cmd`,
+//! `osbx-agent.exe`, optional `winfsp.msi`) using the built-in pure-Rust ISO9660/Joliet writer,
+//! attaches it alongside the Windows ISO and Red Hat `virtio-win.iso`, boots the unattended
+//! installation inside `osbx-vmm`'s Q35 PCIe UEFI VM (Linux/KVM or Windows/WHP), and seals the
+//! resulting QCOW2 base disk + persistent `OVMF_VARS_4M.fd` as a reusable template in
 //! `$OSBX_HOME/templates/`.
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
-
+use crate::iso9660::{IsoFile, write_iso};
 use crate::state::{Launch, assets_dir, check_name, home, write_atomic};
 use serde_json::json;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
+
+/// Windows edition profile for `osbx windows build-base`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowsProfile {
+    /// Windows Server Core (headless, smallest footprint; default image index 1).
+    #[default]
+    Core,
+    /// Windows Server Desktop Experience (full GUI, RDP enabled, Session 1 auto-logon; default image index 2).
+    Desktop,
+    /// Windows 11 Pro/Enterprise (GUI, RDP, OOBE local-account bypass, optional LabConfig bypass when `--vtpm` is off).
+    Win11,
+}
+
+impl WindowsProfile {
+    /// Parse CLI `--profile` value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "core" => Ok(Self::Core),
+            "desktop" => Ok(Self::Desktop),
+            "win11" | "windows11" => Ok(Self::Win11),
+            other => Err(format!(
+                "unknown Windows profile {other:?} (expected core, desktop, or win11)"
+            )),
+        }
+    }
+
+    /// Default `install.wim` image index for this profile when `--image-index` is not explicitly set.
+    pub fn default_image_index(self) -> u32 {
+        match self {
+            Self::Core => 1,
+            Self::Desktop => 2,
+            Self::Win11 => 1,
+        }
+    }
+
+    /// Primary `virtio-win` driver OS subdirectory to inject in WinPE.
+    fn virtio_subdir(self) -> &'static str {
+        match self {
+            Self::Core | Self::Desktop => "2k25",
+            Self::Win11 => "w11",
+        }
+    }
+
+    /// Whether this profile includes an interactive desktop shell (Session 1 + RDP).
+    pub fn has_desktop(self) -> bool {
+        matches!(self, Self::Desktop | Self::Win11)
+    }
+
+    /// Canonical string name stored in template metadata.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Desktop => "desktop",
+            Self::Win11 => "win11",
+        }
+    }
+}
 
 /// Options for `osbx windows build-base`.
 #[derive(Debug, Clone)]
@@ -24,8 +80,10 @@ pub struct BuildBaseOpts {
     pub virtio_win: PathBuf,
     /// Template name saved under `$OSBX_HOME/templates/<name>.*`.
     pub name: String,
-    /// Windows image index inside `install.wim` (1 = Server Standard Core on MS Server 2025 Eval).
-    pub image_index: u32,
+    /// Windows edition profile (`core`, `desktop`, `win11`).
+    pub profile: WindowsProfile,
+    /// Explicit image index inside `install.wim` (`None` uses the profile default).
+    pub image_index: Option<u32>,
     /// Virtual disk size in GiB (default: 40).
     pub disk_gib: u64,
     /// Guest RAM in MiB during unattended install (default: 4096).
@@ -38,6 +96,10 @@ pub struct BuildBaseOpts {
     pub firmware_vars: Option<PathBuf>,
     /// Optional explicit path to `osbx-agent.exe`.
     pub agent_exe: Option<PathBuf>,
+    /// Optional path to a WinFsp MSI installer (`winfsp-*.msi`) for in-guest `virtio-fs` mounts.
+    pub winfsp_msi: Option<PathBuf>,
+    /// Attach an emulated CRB vTPM 2.0 device during installation (recommended for Windows 11).
+    pub vtpm: bool,
     /// Maximum minutes to wait for unattended Windows Setup to finish (default: 45).
     pub timeout_mins: u64,
 }
@@ -63,7 +125,7 @@ pub fn find_ovmf(
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "OVMF_CODE_4M.fd not found (install ovmf package or set OSBX_OVMF_CODE)",
+                "OVMF_CODE_4M.fd not found (install ovmf package, place in $OSBX_HOME/guest, or set OSBX_OVMF_CODE)",
             )
         })?;
     let vars = vars_override
@@ -82,7 +144,7 @@ pub fn find_ovmf(
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "OVMF_VARS_4M.fd not found (install ovmf package or set OSBX_OVMF_VARS)",
+                "OVMF_VARS_4M.fd not found (install ovmf package, place in $OSBX_HOME/guest, or set OSBX_OVMF_VARS)",
             )
         })?;
     Ok((code, vars))
@@ -109,16 +171,60 @@ fn find_windows_agent(override_path: Option<&Path>) -> io::Result<PathBuf> {
         })
 }
 
+fn find_winfsp_msi(override_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = override_path {
+        return Some(p.to_path_buf());
+    }
+    if let Some(p) = std::env::var_os("OSBX_WINFSP_MSI") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for dir in [assets_dir(), home().join("guest")] {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                if name.starts_with("winfsp") && name.ends_with(".msi") {
+                    return Some(e.path());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Generate a UEFI GPT `autounattend.xml` for headless unattended Windows Server / Win 11 install
-/// using `virtio-win` (`viostor`, `viosock`) drivers and `osbx-agent.exe`.
-pub fn generate_autounattend_xml(image_index: u32) -> String {
+/// using `virtio-win` (`viostor`, `viosock`, `viofs`) drivers and `osbx-agent.exe`.
+pub fn generate_autounattend_xml(profile: WindowsProfile, image_index: u32, vtpm: bool) -> String {
+    let os_sub = profile.virtio_subdir();
     let mut driver_paths = String::new();
     for (idx, drive) in ['C', 'D', 'E', 'F'].iter().enumerate() {
         let key = idx + 1;
         driver_paths.push_str(&format!(
-            "        <PathAndCredentials wcm:action=\"add\" wcm:keyValue=\"{key}\"><Path>{drive}:\\viostor\\2k25\\amd64</Path></PathAndCredentials>\n"
+            "        <PathAndCredentials wcm:action=\"add\" wcm:keyValue=\"{key}\"><Path>{drive}:\\viostor\\{os_sub}\\amd64</Path></PathAndCredentials>\n"
         ));
     }
+    let winpe_run_sync = if profile == WindowsProfile::Win11 && !vtpm {
+        r#"      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add"><Order>2</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add"><Order>3</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+      </RunSynchronous>
+"#
+    } else {
+        ""
+    };
+    let specialize_bypass_nro = if profile == WindowsProfile::Win11 {
+        r#"    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+"#
+    } else {
+        ""
+    };
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -135,7 +241,7 @@ pub fn generate_autounattend_xml(image_index: u32) -> String {
 {driver_paths}      </DriverPaths>
     </component>
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-      <DiskConfiguration>
+{winpe_run_sync}      <DiskConfiguration>
         <Disk wcm:action="add">
           <DiskID>0</DiskID>
           <WillWipeDisk>true</WillWipeDisk>
@@ -172,7 +278,7 @@ pub fn generate_autounattend_xml(image_index: u32) -> String {
       <ComputerName>osbx-win</ComputerName>
       <TimeZone>UTC</TimeZone>
     </component>
-  </settings>
+{specialize_bypass_nro}  </settings>
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
       <OOBE>
@@ -214,8 +320,32 @@ pub fn generate_autounattend_xml(image_index: u32) -> String {
     )
 }
 
-fn setup_osbx_cmd() -> &'static str {
-    r#"@echo off
+fn setup_osbx_cmd(profile: WindowsProfile, has_winfsp: bool) -> String {
+    let winfsp_block = if has_winfsp {
+        r#"if exist "%SEED%:\winfsp.msi" (
+  echo [osbx] installing WinFsp from %SEED%: >> %LOG%
+  msiexec /i "%SEED%:\winfsp.msi" /qn /norestart >> %LOG% 2>&1
+)
+"#
+    } else {
+        ""
+    };
+    let desktop_block = if profile.has_desktop() {
+        r#"echo [osbx] configuring Desktop Experience (RDP, Session 1 auto-logon, no screen lock) >> %LOG%
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f >> %LOG% 2>&1
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f >> %LOG% 2>&1
+netsh advfirewall firewall set rule group="remote desktop" new enable=Yes >> %LOG% 2>&1
+net localgroup "Remote Desktop Users" agent /add >> %LOG% 2>&1
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f >> %LOG% 2>&1
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d agent /f >> %LOG% 2>&1
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "Osbx-Agent-2025!" /f >> %LOG% 2>&1
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization" /v NoLockScreen /t REG_DWORD /d 1 /f >> %LOG% 2>&1
+"#
+    } else {
+        ""
+    };
+    format!(
+        r#"@echo off
 set SEED=%1
 mkdir "C:\Program Files\osbx" 2>nul
 mkdir "C:\ProgramData\osbx" 2>nul
@@ -232,59 +362,36 @@ for %%d in (D E F G) do (
     echo [osbx] installing viosock 2k22 from %%d: >> %LOG%
     pnputil /add-driver %%d:\viosock\2k22\amd64\viosock.inf /install >> %LOG% 2>&1
   )
+  if exist %%d:\viofs\2k25\amd64\viofs.inf (
+    echo [osbx] installing viofs 2k25 from %%d: >> %LOG%
+    pnputil /add-driver %%d:\viofs\2k25\amd64\viofs.inf /install >> %LOG% 2>&1
+    if exist %%d:\viofs\2k25\amd64\virtiofs.exe copy /Y %%d:\viofs\2k25\amd64\virtiofs.exe "C:\Program Files\osbx\virtiofs.exe" >> %LOG% 2>&1
+  ) else if exist %%d:\viofs\w11\amd64\viofs.inf (
+    echo [osbx] installing viofs w11 from %%d: >> %LOG%
+    pnputil /add-driver %%d:\viofs\w11\amd64\viofs.inf /install >> %LOG% 2>&1
+    if exist %%d:\viofs\w11\amd64\virtiofs.exe copy /Y %%d:\viofs\w11\amd64\virtiofs.exe "C:\Program Files\osbx\virtiofs.exe" >> %LOG% 2>&1
+  ) else if exist %%d:\viofs\2k22\amd64\viofs.inf (
+    echo [osbx] installing viofs 2k22 from %%d: >> %LOG%
+    pnputil /add-driver %%d:\viofs\2k22\amd64\viofs.inf /install >> %LOG% 2>&1
+    if exist %%d:\viofs\2k22\amd64\virtiofs.exe copy /Y %%d:\viofs\2k22\amd64\virtiofs.exe "C:\Program Files\osbx\virtiofs.exe" >> %LOG% 2>&1
+  )
 )
-sc.exe start VirtioSocketWSP >> %LOG% 2>&1
+{winfsp_block}sc.exe start VirtioSocketWSP >> %LOG% 2>&1
 copy /Y "%SEED%:\osbx-agent.exe" "C:\Program Files\osbx\osbx-agent.exe" >> %LOG% 2>&1
 sc.exe create osbx-agent binPath= "\"C:\Program Files\osbx\osbx-agent.exe\"" start= auto depend= VirtioSocketWSP DisplayName= "osbx Guest Agent" >> %LOG% 2>&1
 sc.exe start osbx-agent >> %LOG% 2>&1
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet" /v EnableActiveProbing /t REG_DWORD /d 0 /f >> %LOG% 2>&1
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator" /v NoActiveProbe /t REG_DWORD /d 1 /f >> %LOG% 2>&1
 powercfg /h off >> %LOG% 2>&1
 powercfg /change standby-timeout-ac 0 >> %LOG% 2>&1
 powercfg /change monitor-timeout-ac 0 >> %LOG% 2>&1
-echo [osbx] setup complete, shutting down template ... >> %LOG%
+{desktop_block}echo [osbx] setup complete, shutting down template ... >> %LOG%
 shutdown /s /t 5 /f /c "osbx template build complete"
 "#
+    )
 }
 
-fn make_seed_iso(dir: &Path, iso_out: &Path) -> io::Result<()> {
-    let status = if Command::new("xorriso").arg("--version").output().is_ok() {
-        Command::new("xorriso")
-            .args([
-                "-as",
-                "mkisofs",
-                "-quiet",
-                "-J",
-                "-R",
-                "-V",
-                "OSBX_SEED",
-                "-o",
-            ])
-            .arg(iso_out)
-            .arg(dir)
-            .status()?
-    } else if Command::new("genisoimage")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        Command::new("genisoimage")
-            .args(["-quiet", "-J", "-R", "-V", "OSBX_SEED", "-o"])
-            .arg(iso_out)
-            .arg(dir)
-            .status()?
-    } else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "xorriso or genisoimage is required to create the unattended seed ISO",
-        ));
-    };
-    if !status.success() {
-        return Err(io::Error::other("failed to build unattended seed ISO"));
-    }
-    Ok(())
-}
-
-/// Build a reusable Windows base template unattended inside `osbx-vmm` (Linux/KVM).
-#[cfg(target_os = "linux")]
+/// Build a reusable Windows base template unattended inside `osbx-vmm` (Linux/KVM or Windows/WHP).
 pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
     check_name(&o.name).map_err(io::Error::other)?;
     for (label, p) in [("Windows ISO", &o.iso), ("virtio-win ISO", &o.virtio_win)] {
@@ -297,21 +404,48 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
     }
     let (fw_code, fw_vars_src) = find_ovmf(o.firmware_code.as_deref(), o.firmware_vars.as_deref())?;
     let agent_exe = find_windows_agent(o.agent_exe.as_deref())?;
+    let winfsp_msi = find_winfsp_msi(o.winfsp_msi.as_deref());
+    if let Some(msi) = &winfsp_msi
+        && !msi.exists()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("WinFsp MSI not found: {}", msi.display()),
+        ));
+    }
+
+    let image_index = o
+        .image_index
+        .unwrap_or_else(|| o.profile.default_image_index());
 
     let tpl_dir = home().join("templates");
     std::fs::create_dir_all(&tpl_dir)?;
     let work = tpl_dir.join(format!(".building-{}", o.name));
     let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(work.join("seed"))?;
+    std::fs::create_dir_all(&work)?;
 
-    std::fs::write(
-        work.join("seed/autounattend.xml"),
-        generate_autounattend_xml(o.image_index),
-    )?;
-    std::fs::write(work.join("seed/setup_osbx.cmd"), setup_osbx_cmd())?;
-    std::fs::copy(&agent_exe, work.join("seed/osbx-agent.exe"))?;
+    let mut seed_files = vec![
+        IsoFile {
+            name: "autounattend.xml".into(),
+            data: generate_autounattend_xml(o.profile, image_index, o.vtpm).into_bytes(),
+        },
+        IsoFile {
+            name: "setup_osbx.cmd".into(),
+            data: setup_osbx_cmd(o.profile, winfsp_msi.is_some()).into_bytes(),
+        },
+        IsoFile {
+            name: "osbx-agent.exe".into(),
+            data: std::fs::read(&agent_exe)?,
+        },
+    ];
+    if let Some(msi) = &winfsp_msi {
+        seed_files.push(IsoFile {
+            name: "winfsp.msi".into(),
+            data: std::fs::read(msi)?,
+        });
+    }
     let seed_iso = work.join("seed.iso");
-    make_seed_iso(&work.join("seed"), &seed_iso)?;
+    write_iso(&seed_iso, "OSBX_SEED", &seed_files)?;
 
     let disk_path = work.join("base.qcow2");
     let vars_path = work.join("vars.fd");
@@ -329,11 +463,22 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
     cfg.cdroms = vec![o.iso.clone(), o.virtio_win.clone(), seed_iso];
     cfg.vsock_cid = Some(osbx_sandbox::GUEST_CID);
     cfg.hyperv = true;
+    cfg.vtpm = o.vtpm.then(|| work.join("tpm.state"));
     cfg.timeout = Some(Duration::from_secs(o.timeout_mins * 60));
 
     eprintln!(
-        "building Windows template {:?} ({} GiB QCOW2, {} MiB RAM, {} vCPUs) ...",
-        o.name, o.disk_gib, o.mem_mib, o.cpus
+        "building Windows template {:?} (profile={}, index={}, {} GiB QCOW2, {} MiB RAM, {} vCPUs{}) ...",
+        o.name,
+        o.profile.as_str(),
+        image_index,
+        o.disk_gib,
+        o.mem_mib,
+        o.cpus,
+        if winfsp_msi.is_some() {
+            ", +WinFsp"
+        } else {
+            ""
+        }
     );
     let fb_path = std::env::var_os("OSBX_WIN_FB").map(PathBuf::from);
     let started = Instant::now();
@@ -427,7 +572,9 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
         "from": o.iso.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "windows.iso".into()),
         "image": format!("windows-template:{}", o.name),
         "guest_os": "windows",
+        "profile": o.profile.as_str(),
         "disk_format": "qcow2",
+        "vtpm": o.vtpm,
         "launch": Launch {
             argv: vec!["cmd.exe".into()],
             env: vec![],
@@ -447,7 +594,6 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn save_fb_ppm(vm: &osbx_vmm::UefiVm, path: &Path) {
     if let Some((w, h, bpp, data)) = vm.framebuffer() {
         let stride = usize::from(bpp / 8);
@@ -464,25 +610,39 @@ fn save_fb_ppm(vm: &osbx_vmm::UefiVm, path: &Path) {
     }
 }
 
-/// Build a reusable Windows base template (currently Linux/KVM only; WHP support is Phase W2).
-#[cfg(not(target_os = "linux"))]
-pub fn build_base(_o: &BuildBaseOpts) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "osbx windows build-base currently requires a Linux/KVM host (WHP support is Phase W2)",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn autounattend_xml_contains_gpt_and_virtio_drivers() {
-        let xml = generate_autounattend_xml(1);
+        let xml = generate_autounattend_xml(WindowsProfile::Core, 1, false);
         assert!(xml.contains("<Key>/IMAGE/INDEX</Key><Value>1</Value>"));
         assert!(xml.contains("viostor\\2k25\\amd64"));
         assert!(xml.contains("<Type>EFI</Type>"));
         assert!(xml.contains("setup_osbx.cmd"));
+        assert!(!xml.contains("BypassTPMCheck"));
+    }
+
+    #[test]
+    fn win11_profile_adds_labconfig_when_vtpm_disabled() {
+        let xml_no_tpm = generate_autounattend_xml(WindowsProfile::Win11, 1, false);
+        assert!(xml_no_tpm.contains("BypassTPMCheck"));
+        assert!(xml_no_tpm.contains("BypassNRO"));
+        assert!(xml_no_tpm.contains("viostor\\w11\\amd64"));
+
+        let xml_with_tpm = generate_autounattend_xml(WindowsProfile::Win11, 1, true);
+        assert!(!xml_with_tpm.contains("BypassTPMCheck"));
+        assert!(xml_with_tpm.contains("BypassNRO"));
+    }
+
+    #[test]
+    fn desktop_setup_script_enables_rdp_and_viofs() {
+        let cmd = setup_osbx_cmd(WindowsProfile::Desktop, true);
+        assert!(cmd.contains("viofs.inf"));
+        assert!(cmd.contains("virtiofs.exe"));
+        assert!(cmd.contains("winfsp.msi"));
+        assert!(cmd.contains("fDenyTSConnections"));
+        assert!(cmd.contains("AutoAdminLogon"));
     }
 }

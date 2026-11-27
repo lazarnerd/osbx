@@ -236,6 +236,8 @@ pub struct CreateOpts {
     pub extra_shares: Vec<StoredShare>,
     /// Optional per-sandbox egress firewall.
     pub firewall: Option<osbx_spec::FirewallSpec>,
+    /// Attach an emulated CRB vTPM 2.0 device (`0xFED4_0000`, Windows UEFI guests).
+    pub vtpm: bool,
 }
 
 fn default_name(agent: &str, ws: Option<&Path>) -> String {
@@ -367,7 +369,9 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
         .filter(|k| k.kind == "mixin")
         .filter_map(|k| k.image.clone())
         .collect();
-    let (image, base, launch, guest_os, template_vars, is_qcow2_tpl) = match &o.template {
+    let (image, base, launch, guest_os, template_vars, is_qcow2_tpl, template_vtpm) = match &o
+        .template
+    {
         Some(t) => {
             let meta: Value = serde_json::from_slice(
                 &std::fs::read(template_dir().join(format!("{t}.json")))
@@ -394,6 +398,7 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
             let vars = template_dir().join(format!("{t}.vars.fd"));
             let launch: Launch =
                 serde_json::from_value(meta["launch"].clone()).map_err(io::Error::other)?;
+            let tpl_vtpm = meta["vtpm"].as_bool().unwrap_or(false);
             (
                 meta["image"].as_str().unwrap_or(&image).to_owned(),
                 disk,
@@ -401,6 +406,7 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
                 guest_os,
                 vars.exists().then_some(vars),
                 is_qcow2,
+                tpl_vtpm,
             )
         }
         None => {
@@ -412,7 +418,7 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
             }
             let base = base_rootfs(&image, &overlays)?;
             let launch = crate::images::launch_of(&image)?;
-            (image, base, launch, GuestOs::Linux, None, false)
+            (image, base, launch, GuestOs::Linux, None, false, false)
         }
     };
     let dir = sandbox_dir(&name);
@@ -485,6 +491,7 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
         workdir: o.workdir.clone(),
         extra_shares: o.extra_shares.clone(),
         firewall: o.firewall.clone(),
+        vtpm: o.vtpm || template_vtpm,
         launch,
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1214,6 +1221,7 @@ fn spec_to_create_opts(
         workdir: spec.workdir.clone(),
         extra_shares,
         firewall,
+        vtpm: false,
     };
 
     let name = opts
@@ -1523,6 +1531,7 @@ mod tests {
             workdir: None,
             extra_shares: vec![],
             firewall: None,
+            vtpm: false,
         };
         let r = agent_request(&rec, &[]);
         assert_eq!(

@@ -3,47 +3,58 @@
 //! Runs as a LocalSystem Windows Service (`osbx-agent`, or `--console` interactively) inside a
 //! Windows guest VM and serves the exact `osbx-proto` protocol over Red Hat `virtio-win`'s
 //! `viosock.sys` (`AF_VSOCK`) transport:
-//! * `AGENT_PORT (1024)`: framed `EXEC` (pipes or ConPTY), `RESIZE`, `SIGNAL`, `POWEROFF`
+//! * `AGENT_PORT (1024)`: framed `EXEC` (pipes or ConPTY, default least-privilege `agent` user,
+//!   `-u Administrator` / `-u SYSTEM` elevated without UAC, and `--gui` Session 0 -> Session 1
+//!   desktop bridge), `RESIZE`, `SIGNAL`, `POWEROFF`
 //! * `TUNNEL_PORT (1025)`: raw host -> guest TCP port forwarding (RDP, HTTP, etc.)
+//! * `SSH_AGENT_PORT (1026)`: Windows OpenSSH named pipe `\\.\pipe\openssh-ssh-agent` -> host
+//!   `ssh_agent::bridge`
 //! * `EGRESS_PORT (3128)`: guest `127.0.0.1:3128` -> host policy proxy (no virtual NIC)
 //! * `--install-ca <pem>`: installs the sandbox CA into `LocalMachine\Root` and wires WinHTTP,
-//!   WinINET, and machine proxy environment variables.
+//!   WinINET, `.NET`, and machine proxy environment variables.
 
 #![allow(unsafe_code)]
 
 use osbx_proto::{
-    AGENT_PORT, CHUNK, EGRESS_PORT, ERROR, EXEC, EXIT, ExecRequest, GUEST_PROXY_ADDR, POWEROFF,
-    RESIZE, SIGNAL, STDERR, STDIN, STDIN_EOF, STDOUT, TUNNEL_PORT, read_frame, write_frame,
+    AGENT_PORT, CHUNK, EGRESS_PORT, ERROR, EXEC, EXIT, ExecRequest, GUEST_PROXY_ADDR,
+    GUEST_WINDOWS_SSH_AGENT_PIPE, POWEROFF, RESIZE, SIGNAL, SSH_AGENT_PORT, STDERR, STDIN,
+    STDIN_EOF, STDOUT, TUNNEL_PORT, read_frame, write_frame,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LUID, SetHandleInformation,
+    CloseHandle, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_PIPE_CONNECTED, GetLastError,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LUID, LocalFree, SetHandleInformation,
 };
 use windows_sys::Win32::Networking::WinSock::{
     INVALID_SOCKET, SD_SEND, SOCK_STREAM, SOCKET, SOCKET_ERROR, WSADATA, WSAStartup, accept, bind,
     closesocket, connect, listen, recv, send, shutdown, socket,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_LOCAL_MACHINE,
     CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, X509_ASN_ENCODING,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
-    SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, DuplicateTokenEx, LOGON32_LOGON_BATCH, LOGON32_LOGON_INTERACTIVE,
+    LOGON32_PROVIDER_DEFAULT, LUID_AND_ATTRIBUTES, LogonUserW, LookupPrivilegeValueW,
+    PSECURITY_DESCRIPTOR, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, SecurityImpersonation,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrimary,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
-    WriteFile,
+    CreateFileW, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
@@ -54,10 +65,17 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegSetValueExW,
+};
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW, WTSFreeMemory,
+    WTSQueryUserToken,
 };
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
@@ -69,11 +87,11 @@ use windows_sys::Win32::System::Shutdown::{
     InitiateSystemShutdownExW, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OTHER,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, OpenProcessToken, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 const HOST_CID: u32 = 2;
@@ -82,6 +100,10 @@ const VMADDR_CID_ANY: u32 = u32::MAX;
 /// `CTL_CODE(FILE_DEVICE_UNKNOWN (0x22), 0x800, METHOD_BUFFERED (0), FILE_ANY_ACCESS (0))`.
 const IOCTL_VIOSOCK_GET_AF: u32 = 0x0022_2000;
 const FALLBACK_AF_VSOCK: u16 = 40;
+/// Maximum single SSH agent protocol message (256 KiB, matching OpenSSH `MAX_MSG_LEN`).
+const MAX_SSH_AGENT_MSG: usize = 256 * 1024;
+const AGENT_PASSWORD: &str = "Osbx-Agent-2025!";
+const ADMIN_PASSWORD: &str = "Osbx-Admin-2025!";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -198,6 +220,7 @@ fn run_agent_loop() {
 
     thread::spawn(move || accept_loop(af, AGENT_PORT, handle_control));
     thread::spawn(move || accept_loop(af, TUNNEL_PORT, handle_tunnel));
+    thread::spawn(move || ssh_agent_pipe_loop(af));
     egress_listener(af);
 }
 
@@ -425,6 +448,130 @@ fn egress_listener(af: u16) {
     }
 }
 
+/// Serve the standard Windows OpenSSH agent named pipe (`\\.\pipe\openssh-ssh-agent`) and forward
+/// every SSH agent message to the host's filtered `ssh_agent::bridge` on `SSH_AGENT_PORT (1026)`.
+fn ssh_agent_pipe_loop(af: u16) {
+    let pipe_name = wide(GUEST_WINDOWS_SSH_AGENT_PIPE);
+    // Allow Authenticated Users (`AU`) + SYSTEM (`SY`) + Administrators (`BA`) full pipe R/W so
+    // both `agent` and `Administrator` sessions can talk to `\\.\pipe\openssh-ssh-agent`.
+    let sddl = wide("D:(A;;GRGW;;;AU)(A;;GA;;;SY)(A;;GA;;;BA)");
+    loop {
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: converts constant SDDL string into a heap-allocated security descriptor.
+        let sd_ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                null_mut(),
+            )
+        };
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: if sd_ok != 0 { sd } else { null_mut() },
+            bInheritHandle: 0,
+        };
+        // SAFETY: creates a byte-stream duplex named pipe instance.
+        let h = unsafe {
+            CreateNamedPipeW(
+                pipe_name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                65536,
+                65536,
+                0,
+                &sa,
+            )
+        };
+        if !sd.is_null() {
+            // SAFETY: frees security descriptor allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+            unsafe {
+                LocalFree(sd);
+            }
+        }
+        if h == INVALID_HANDLE_VALUE {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        // SAFETY: waits for a client to connect to the named pipe instance.
+        let connected = unsafe { ConnectNamedPipe(h, null_mut()) } != 0
+            || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        if !connected {
+            // SAFETY: closing unused pipe handle.
+            unsafe {
+                CloseHandle(h);
+            }
+            continue;
+        }
+        let pipe = OwnedHandle(h);
+        thread::spawn(move || handle_ssh_agent_pipe(af, pipe));
+    }
+}
+
+fn read_exact_handle(handle: HANDLE, mut dst: &mut [u8]) -> bool {
+    while !dst.is_empty() {
+        let mut n: u32 = 0;
+        // SAFETY: reads into valid writable buffer from open pipe handle.
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                dst.as_mut_ptr(),
+                dst.len().min(u32::MAX as usize) as u32,
+                &mut n,
+                null_mut(),
+            )
+        };
+        if ok == 0 || n == 0 {
+            return false;
+        }
+        dst = &mut dst[n as usize..];
+    }
+    true
+}
+
+/// Relay SSH agent RFC messages (`u32 BE len + payload`) between the synchronous named pipe and
+/// the host vsock `SSH_AGENT_PORT`. Half-duplex framing avoids Windows synchronous pipe deadlocks.
+fn handle_ssh_agent_pipe(af: u16, pipe: OwnedHandle) {
+    if let Ok(mut vs) = vsock_connect(af, HOST_CID, SSH_AGENT_PORT) {
+        let mut hdr = [0u8; 4];
+        loop {
+            if !read_exact_handle(pipe.0, &mut hdr) {
+                break;
+            }
+            let req_len = u32::from_be_bytes(hdr) as usize;
+            if req_len == 0 || req_len > MAX_SSH_AGENT_MSG {
+                break;
+            }
+            let mut body = vec![0u8; req_len];
+            if !read_exact_handle(pipe.0, &mut body) {
+                break;
+            }
+            if vs.write_all(&hdr).is_err() || vs.write_all(&body).is_err() {
+                break;
+            }
+            if vs.read_exact(&mut hdr).is_err() {
+                break;
+            }
+            let rsp_len = u32::from_be_bytes(hdr) as usize;
+            if rsp_len == 0 || rsp_len > MAX_SSH_AGENT_MSG {
+                break;
+            }
+            let mut rsp = vec![0u8; rsp_len];
+            if vs.read_exact(&mut rsp).is_err() {
+                break;
+            }
+            if !write_all_handle(pipe.0, &hdr) || !write_all_handle(pipe.0, &rsp) {
+                break;
+            }
+        }
+    }
+    // SAFETY: disconnects client before `OwnedHandle` closes the pipe handle.
+    unsafe {
+        DisconnectNamedPipe(pipe.0);
+    }
+}
+
 fn handle_tunnel(vs: VsockConn) {
     let mut reader = BufReader::new(vs.clone());
     let mut line = String::new();
@@ -480,7 +627,7 @@ fn handle_control(mut conn: VsockConn) {
                 let _ = write_frame(&mut conn, ERROR, b"empty argv");
                 return;
             }
-            let res = if req.tty {
+            let res = if req.tty && !req.gui {
                 run_exec_conpty(conn.clone(), &req)
             } else {
                 run_exec_piped(conn.clone(), &req)
@@ -543,11 +690,30 @@ fn build_cmdline(argv: &[String]) -> String {
 }
 
 /// Build a Windows UTF-16 `CREATE_UNICODE_ENVIRONMENT` block, merging the host system environment
-/// with `overrides` (case-insensitive key replacement).
-fn build_env_block(overrides: &BTreeMap<String, String>) -> Vec<u16> {
+/// with per-user profile defaults and `overrides` (case-insensitive key replacement).
+fn build_env_block(overrides: &BTreeMap<String, String>, profile_user: Option<&str>) -> Vec<u16> {
     let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
     for (k, v) in std::env::vars() {
         merged.insert(k.to_ascii_uppercase(), (k, v));
+    }
+    if let Some(user) = profile_user {
+        let profile = format!(r"C:\Users\{user}");
+        if Path::new(&profile).is_dir() {
+            let tmp = format!(r"{profile}\AppData\Local\Temp");
+            let _ = std::fs::create_dir_all(&tmp);
+            for (k, v) in [
+                ("USERNAME", user.to_owned()),
+                ("USERPROFILE", profile.clone()),
+                ("HOMEPATH", format!(r"\Users\{user}")),
+                ("HOMEDRIVE", "C:".to_owned()),
+                ("APPDATA", format!(r"{profile}\AppData\Roaming")),
+                ("LOCALAPPDATA", format!(r"{profile}\AppData\Local")),
+                ("TEMP", tmp.clone()),
+                ("TMP", tmp),
+            ] {
+                merged.insert(k.to_owned(), (k.to_owned(), v));
+            }
+        }
     }
     for (k, v) in overrides {
         merged.insert(k.to_ascii_uppercase(), (k.clone(), v.clone()));
@@ -564,7 +730,7 @@ fn build_env_block(overrides: &BTreeMap<String, String>) -> Vec<u16> {
 }
 
 struct OwnedHandle(HANDLE);
-// SAFETY: Win32 kernel handles (pipes, processes, jobs) are valid across threads in this process.
+// SAFETY: Win32 kernel handles (pipes, processes, jobs, tokens) are valid across threads in this process.
 unsafe impl Send for OwnedHandle {}
 // SAFETY: Win32 kernel handles are synchronized by the OS kernel.
 unsafe impl Sync for OwnedHandle {}
@@ -579,19 +745,265 @@ impl Drop for OwnedHandle {
     }
 }
 
+/// Resolved execution identity for a Windows guest command.
+struct ExecIdentity {
+    /// Primary token for `CreateProcessAsUserW` (`None` = inherit LocalSystem service token).
+    token: Option<OwnedHandle>,
+    /// Username whose `C:\Users\<name>` profile variables should be populated, if any.
+    profile_user: Option<String>,
+    /// Explicit desktop (`winsta0\default` when `req.gui` is set).
+    desktop: Option<Vec<u16>>,
+}
+
+fn logon_primary_token(user: &str, password: &str) -> io::Result<OwnedHandle> {
+    let u = wide(user);
+    let d = wide(".");
+    let p = wide(password);
+    for logon_type in [LOGON32_LOGON_INTERACTIVE, LOGON32_LOGON_BATCH] {
+        let mut tok: HANDLE = null_mut();
+        // SAFETY: `LogonUserW` authenticates the local Windows account and writes a primary token.
+        let ok = unsafe {
+            LogonUserW(
+                u.as_ptr(),
+                d.as_ptr(),
+                p.as_ptr(),
+                logon_type,
+                LOGON32_PROVIDER_DEFAULT,
+                &mut tok,
+            )
+        };
+        if ok != 0 {
+            return Ok(OwnedHandle(tok));
+        }
+    }
+    Err(io::Error::last_os_error())
+}
+
+/// Session 0 -> Session 1 GUI bridge: find the active interactive WTS session and duplicate its
+/// user token as a primary token suitable for `CreateProcessAsUserW` on `winsta0\default`.
+fn query_active_session_token() -> io::Result<OwnedHandle> {
+    let mut sessions: *mut WTS_SESSION_INFOW = null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: enumerates local WTS sessions; freed below with `WTSFreeMemory`.
+    if unsafe { WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut active_id: Option<u32> = None;
+    if !sessions.is_null() {
+        // SAFETY: `sessions` points to `count` valid `WTS_SESSION_INFOW` entries.
+        let slice = unsafe { std::slice::from_raw_parts(sessions, count as usize) };
+        for s in slice {
+            if s.State == WTSActive && s.SessionId != 0 {
+                active_id = Some(s.SessionId);
+                break;
+            }
+        }
+        // SAFETY: frees buffer allocated by `WTSEnumerateSessionsW`.
+        unsafe {
+            WTSFreeMemory(sessions.cast());
+        }
+    }
+    let sid = active_id.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no active interactive desktop session found (use a desktop/win11 template or log in over RDP first)",
+        )
+    })?;
+    let mut user_tok: HANDLE = null_mut();
+    // SAFETY: queries logged-on user token for the active interactive session (requires LocalSystem).
+    if unsafe { WTSQueryUserToken(sid, &mut user_tok) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let user_tok = OwnedHandle(user_tok);
+    let mut primary: HANDLE = null_mut();
+    // SAFETY: duplicates into a primary token for `CreateProcessAsUserW`.
+    let ok = unsafe {
+        DuplicateTokenEx(
+            user_tok.0,
+            TOKEN_ALL_ACCESS,
+            null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedHandle(primary))
+}
+
+fn resolve_exec_identity(req: &ExecRequest) -> io::Result<ExecIdentity> {
+    if req.gui {
+        let tok = query_active_session_token()?;
+        return Ok(ExecIdentity {
+            token: Some(tok),
+            profile_user: Some("agent".into()),
+            desktop: Some(wide(r"winsta0\default")),
+        });
+    }
+    match req.user.as_deref() {
+        Some(u)
+            if u.eq_ignore_ascii_case("system")
+                || u.eq_ignore_ascii_case(r"nt authority\system")
+                || u.eq_ignore_ascii_case("root") =>
+        {
+            Ok(ExecIdentity {
+                token: None,
+                profile_user: None,
+                desktop: None,
+            })
+        }
+        Some(u) if u.eq_ignore_ascii_case("administrator") || u.eq_ignore_ascii_case("admin") => {
+            match logon_primary_token("Administrator", ADMIN_PASSWORD) {
+                Ok(tok) => Ok(ExecIdentity {
+                    token: Some(tok),
+                    profile_user: Some("Administrator".into()),
+                    desktop: None,
+                }),
+                // Fallback to LocalSystem (still elevated, no UAC) if Administrator password changed.
+                Err(_) => Ok(ExecIdentity {
+                    token: None,
+                    profile_user: Some("Administrator".into()),
+                    desktop: None,
+                }),
+            }
+        }
+        None => {
+            // Least-privilege default: run as the non-admin `agent` user when present.
+            match logon_primary_token("agent", AGENT_PASSWORD) {
+                Ok(tok) => Ok(ExecIdentity {
+                    token: Some(tok),
+                    profile_user: Some("agent".into()),
+                    desktop: None,
+                }),
+                Err(_) => Ok(ExecIdentity {
+                    token: None,
+                    profile_user: None,
+                    desktop: None,
+                }),
+            }
+        }
+        Some(u) if u.eq_ignore_ascii_case("agent") => {
+            let tok = logon_primary_token("agent", AGENT_PASSWORD)?;
+            Ok(ExecIdentity {
+                token: Some(tok),
+                profile_user: Some("agent".into()),
+                desktop: None,
+            })
+        }
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported Windows user {other:?} (supported: agent, Administrator, SYSTEM)"),
+        )),
+    }
+}
+
+fn default_cwd(req: &ExecRequest, profile_user: Option<&str>) -> Option<Vec<u16>> {
+    if let Some(c) = req.cwd.as_deref() {
+        return Some(wide(c));
+    }
+    if Path::new(r"C:\workspace").is_dir() {
+        return Some(wide(r"C:\workspace"));
+    }
+    if let Some(u) = profile_user {
+        let home = format!(r"C:\Users\{u}");
+        if Path::new(&home).is_dir() {
+            return Some(wide(&home));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_process(
+    token: Option<HANDLE>,
+    cmd: &mut [u16],
+    inherit_handles: bool,
+    creation_flags: u32,
+    env: &mut [u16],
+    cwd: Option<&[u16]>,
+    si: &STARTUPINFOW,
+) -> io::Result<PROCESS_INFORMATION> {
+    // SAFETY: `PROCESS_INFORMATION` is plain old data filled by `CreateProcess*`.
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let cwd_ptr = cwd.map_or(null(), |w| w.as_ptr());
+    let inherit = i32::from(inherit_handles);
+    let ok = if let Some(tok) = token {
+        // SAFETY: spawns child under the resolved primary user token.
+        unsafe {
+            CreateProcessAsUserW(
+                tok,
+                null(),
+                cmd.as_mut_ptr(),
+                null(),
+                null(),
+                inherit,
+                creation_flags,
+                env.as_mut_ptr().cast(),
+                cwd_ptr,
+                si,
+                &mut pi,
+            )
+        }
+    } else {
+        // SAFETY: spawns child under the current LocalSystem token.
+        unsafe {
+            CreateProcessW(
+                null(),
+                cmd.as_mut_ptr(),
+                null(),
+                null(),
+                inherit,
+                creation_flags,
+                env.as_mut_ptr().cast(),
+                cwd_ptr,
+                si,
+                &mut pi,
+            )
+        }
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pi)
+}
+
 fn create_pipe_pair(
     inherit_read: bool,
     inherit_write: bool,
 ) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    // Give pipes an explicit permissive DACL so child processes running as `agent` or Session 1
+    // users can always read/write redirected std handles created by the LocalSystem service.
+    let sddl = wide("D:(A;;GA;;;AU)(A;;GA;;;SY)(A;;GA;;;BA)");
+    let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: converts constant SDDL string into a security descriptor.
+    let sd_ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            null_mut(),
+        )
+    };
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
+        lpSecurityDescriptor: if sd_ok != 0 { sd } else { null_mut() },
         bInheritHandle: 1,
     };
     let mut r: HANDLE = null_mut();
     let mut w: HANDLE = null_mut();
     // SAFETY: `CreatePipe` initializes `r` and `w`.
-    if unsafe { CreatePipe(&mut r, &mut w, &sa, 0) } == 0 {
+    let ok = unsafe { CreatePipe(&mut r, &mut w, &sa, 0) };
+    if !sd.is_null() {
+        // SAFETY: frees security descriptor allocated above.
+        unsafe {
+            LocalFree(sd);
+        }
+    }
+    if ok == 0 {
         return Err(io::Error::last_os_error());
     }
     if !inherit_read {
@@ -683,41 +1095,39 @@ fn write_all_handle(handle: HANDLE, mut data: &[u8]) -> bool {
 }
 
 fn run_exec_piped(conn: VsockConn, req: &ExecRequest) -> io::Result<()> {
+    let mut ident = resolve_exec_identity(req)?;
     let (in_r, in_w) = create_pipe_pair(true, false)?;
     let (out_r, out_w) = create_pipe_pair(false, true)?;
     let (err_r, err_w) = create_pipe_pair(false, true)?;
 
     let mut cmd = wide(&build_cmdline(&req.argv));
-    let mut env = build_env_block(&req.env);
-    let cwd = req.cwd.as_deref().map(wide);
+    let mut env = build_env_block(&req.env, ident.profile_user.as_deref());
+    let cwd = default_cwd(req, ident.profile_user.as_deref());
 
     // SAFETY: `STARTUPINFOW` is plain old data.
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = in_r.0;
-    si.hStdOutput = out_w.0;
-    si.hStdError = err_w.0;
-    // SAFETY: `PROCESS_INFORMATION` is plain old data filled by `CreateProcessW`.
-    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: spawns child process with explicit redirected std handles.
-    let ok = unsafe {
-        CreateProcessW(
-            null(),
-            cmd.as_mut_ptr(),
-            null(),
-            null(),
-            1,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            env.as_mut_ptr().cast(),
-            cwd.as_ref().map_or(null(), |w| w.as_ptr()),
-            &si,
-            &mut pi,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
+    if let Some(desk) = &mut ident.desktop {
+        si.lpDesktop = desk.as_mut_ptr();
     }
+    let flags = if req.gui {
+        CREATE_UNICODE_ENVIRONMENT
+    } else {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = in_r.0;
+        si.hStdOutput = out_w.0;
+        si.hStdError = err_w.0;
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+    };
+    let pi = spawn_process(
+        ident.token.as_ref().map(|h| h.0),
+        &mut cmd,
+        !req.gui,
+        flags,
+        &mut env,
+        cwd.as_deref(),
+        &si,
+    )?;
     drop(in_r);
     drop(out_w);
     drop(err_w);
@@ -794,6 +1204,7 @@ fn run_exec_piped(conn: VsockConn, req: &ExecRequest) -> io::Result<()> {
 }
 
 fn run_exec_conpty(conn: VsockConn, req: &ExecRequest) -> io::Result<()> {
+    let ident = resolve_exec_identity(req)?;
     let (in_r, in_w) = create_pipe_pair(false, false)?;
     let (out_r, out_w) = create_pipe_pair(false, false)?;
     let cols = if req.cols == 0 { 80 } else { req.cols } as i16;
@@ -872,33 +1283,22 @@ fn run_exec_conpty(conn: VsockConn, req: &ExecRequest) -> io::Result<()> {
     }
 
     let mut cmd = wide(&build_cmdline(&req.argv));
-    let mut env = build_env_block(&req.env);
-    let cwd = req.cwd.as_deref().map(wide);
+    let mut env = build_env_block(&req.env, ident.profile_user.as_deref());
+    let cwd = default_cwd(req, ident.profile_user.as_deref());
     // SAFETY: `STARTUPINFOEXW` is plain old data.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     si.lpAttributeList = attr_list;
 
-    // SAFETY: `PROCESS_INFORMATION` is plain old data filled by `CreateProcessW`.
-    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: spawns child attached to ConPTY via `EXTENDED_STARTUPINFO_PRESENT`.
-    let ok = unsafe {
-        CreateProcessW(
-            null(),
-            cmd.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            env.as_mut_ptr().cast(),
-            cwd.as_ref().map_or(null(), |w| w.as_ptr()),
-            &si.StartupInfo,
-            &mut pi,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let pi = spawn_process(
+        ident.token.as_ref().map(|h| h.0),
+        &mut cmd,
+        false,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+        &mut env,
+        cwd.as_deref(),
+        &si.StartupInfo,
+    )?;
     drop(in_r);
     drop(out_w);
 
@@ -989,7 +1389,7 @@ fn run_exec_conpty(conn: VsockConn, req: &ExecRequest) -> io::Result<()> {
 }
 
 /// Install a PEM-encoded CA certificate into `LocalMachine\Root` and configure WinHTTP, WinINET,
-/// and machine proxy environment variables.
+/// `.NET`, and machine proxy environment variables.
 fn install_ca_and_proxy(pem_path: &str) -> io::Result<()> {
     let pem = std::fs::read_to_string(pem_path)?;
     let der = decode_pem_cert(&pem)?;

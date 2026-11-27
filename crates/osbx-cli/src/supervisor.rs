@@ -370,14 +370,23 @@ pub fn supervise(name: &str) -> io::Result<()> {
     env.extend(rec.env.clone());
     // Node-based agents (Claude Code) do not read the system CA bundle: point them at the
     // sandbox CA so intercepted hosts (credential injection, OAuth) are trusted
-    env.entry("NODE_EXTRA_CA_CERTS".into())
-        .or_insert_with(|| "/usr/local/share/ca-certificates/osbx-ca.crt".into());
+    env.entry("NODE_EXTRA_CA_CERTS".into()).or_insert_with(|| {
+        if rec.guest_os == GuestOs::Windows {
+            r"C:\ProgramData\osbx\ca.pem".into()
+        } else {
+            "/usr/local/share/ca-certificates/osbx-ca.crt".into()
+        }
+    });
     // runtime-owned identity of the sandbox (sbx@1 asks for these; harmless for everyone)
     env.insert("SANDBOX_NAME".into(), name.to_owned());
     if let Some(wd) = &rec.workdir {
         env.insert("WORKSPACE_DIR".into(), wd.clone());
     } else if let Some(ws) = &rec.workspace {
-        env.insert("WORKSPACE_DIR".into(), crate::state::guest_path(&ws.host));
+        if rec.guest_os == GuestOs::Windows {
+            env.insert("WORKSPACE_DIR".into(), r"C:\workspace".into());
+        } else {
+            env.insert("WORKSPACE_DIR".into(), crate::state::guest_path(&ws.host));
+        }
     }
     if crate::kits::sbx_platform(&rec.kits) {
         env.entry("CLAUDE_ENV_FILE".into())
@@ -448,9 +457,15 @@ pub fn supervise(name: &str) -> io::Result<()> {
         None => None,
     };
     if kit_ssh.as_ref().is_some_and(|sa| sa.runtime) {
-        env.entry("SSH_AUTH_SOCK".into())
-            .or_insert_with(|| osbx_proto::GUEST_SSH_AUTH_SOCK.into());
+        env.entry("SSH_AUTH_SOCK".into()).or_insert_with(|| {
+            if rec.guest_os == GuestOs::Windows {
+                osbx_proto::GUEST_WINDOWS_SSH_AGENT_PIPE.into()
+            } else {
+                osbx_proto::GUEST_SSH_AUTH_SOCK.into()
+            }
+        });
     }
+    let mut win_mounts: Vec<(String, String)> = Vec::new();
     let sb = match rec.guest_os {
         GuestOs::Linux => {
             // a larger disk size in the record (CLI --disk or sbxenv rootSize) is applied before boot
@@ -489,39 +504,34 @@ pub fn supervise(name: &str) -> io::Result<()> {
             })?
         }
         GuestOs::Windows => {
-            #[cfg(target_os = "linux")]
-            {
-                let (fw_code, _) = crate::windows::find_ovmf(None, None)?;
-                let fw_vars = dir.join("ovmf_vars.fd");
-                let root_disk = if dir.join("root.qcow2").exists() {
-                    dir.join("root.qcow2")
-                } else {
-                    dir.join("root.img")
-                };
-                Sandbox::start_uefi(osbx_sandbox::UefiSandboxConfig {
-                    name: name.to_owned(),
-                    firmware_code: fw_code,
-                    firmware_vars: fw_vars,
-                    disks: vec![osbx_vmm_disk(root_disk)],
-                    cdroms: vec![],
-                    mem_mib: rec.mem_mib,
-                    cpus: rec.cpus,
-                    policy: policy.clone(),
-                    credentials,
-                    ca: Arc::new(ca),
-                    env,
-                    upstream: None,
-                    client_tls: None,
-                    events: Some(ev_tx),
-                })?
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Windows-guest sandboxes currently require a Linux/KVM host (WHP UEFI support is Phase W2)",
-                ));
-            }
+            let (fw_code, _) = crate::windows::find_ovmf(None, None)?;
+            let fw_vars = dir.join("ovmf_vars.fd");
+            let root_disk = if dir.join("root.qcow2").exists() {
+                dir.join("root.qcow2")
+            } else {
+                dir.join("root.img")
+            };
+            let (win_shares, mounts) = build_windows_shares(&rec, &dir, &shares);
+            win_mounts = mounts;
+            Sandbox::start_uefi(osbx_sandbox::UefiSandboxConfig {
+                name: name.to_owned(),
+                firmware_code: fw_code,
+                firmware_vars: fw_vars,
+                disks: vec![osbx_vmm_disk(root_disk)],
+                cdroms: vec![],
+                shares: win_shares,
+                mem_mib: rec.mem_mib,
+                cpus: rec.cpus,
+                policy: policy.clone(),
+                credentials,
+                ca: Arc::new(ca),
+                env,
+                upstream: None,
+                client_tls: None,
+                events: Some(ev_tx),
+                ssh_agent,
+                vtpm: rec.vtpm.then(|| dir.join("tpm.state")),
+            })?
         }
     };
     sb.wait_ready(Duration::from_secs(if rec.guest_os == GuestOs::Windows {
@@ -530,7 +540,7 @@ pub fn supervise(name: &str) -> io::Result<()> {
         120
     }))?;
     if rec.guest_os == GuestOs::Windows {
-        first_boot_setup_windows(&sb, &ca_pem);
+        first_boot_setup_windows(&sb, &ca_pem, &win_mounts);
     } else {
         first_boot_setup(&sb, &rec, &ca_pem);
     }
@@ -635,14 +645,107 @@ usermod -aG kvm "$name" 2>/dev/null || adduser "$name" kvm >/dev/null 2>&1 || \
     }
 }
 
-/// Windows guest first-boot setup: push the per-sandbox CA PEM and invoke `osbx-agent.exe
-/// --install-ca` to trust it in `LocalMachine\Root` and configure WinHTTP/WinINET/env proxy.
-fn first_boot_setup_windows(sb: &Sandbox, ca_pem: &str) {
+/// Build `virtio-fs` share configs and `(tag, Windows mount path)` pairs for a Windows guest.
+fn build_windows_shares(
+    rec: &Record,
+    sandbox_dir: &std::path::Path,
+    all_shares: &[Share],
+) -> (Vec<osbx_vmm::ShareConfig>, Vec<(String, String)>) {
+    let mut configs = Vec::new();
+    let mut mounts = Vec::new();
+    let mut ws_host_dirs: Vec<&std::path::Path> = Vec::new();
+
+    if let Some(ws) = &rec.workspace {
+        match ws.mode {
+            WorkspaceMode::Direct => {
+                configs.push(osbx_vmm::ShareConfig {
+                    tag: "workspace".into(),
+                    host_dir: ws.host.clone(),
+                    read_only: false,
+                });
+                mounts.push(("workspace".into(), r"C:\workspace".into()));
+                ws_host_dirs.push(ws.host.as_path());
+            }
+            WorkspaceMode::Clone => {
+                let clone_dir = sandbox_dir.join("clone");
+                configs.push(osbx_vmm::ShareConfig {
+                    tag: "workspace".into(),
+                    host_dir: clone_dir,
+                    read_only: false,
+                });
+                mounts.push(("workspace".into(), r"C:\workspace".into()));
+                configs.push(osbx_vmm::ShareConfig {
+                    tag: "source".into(),
+                    host_dir: ws.host.clone(),
+                    read_only: true,
+                });
+                mounts.push(("source".into(), r"C:\mnt\source".into()));
+                ws_host_dirs.push(ws.host.as_path());
+            }
+        }
+    }
+
+    // Extra shares (kit host-mount@1, volume@1, extra_shares) — skip workspace shares already added.
+    let mut extra_idx = 0usize;
+    let clone_path = sandbox_dir.join("clone");
+    for sh in all_shares {
+        if sh.guest_path == CLONE_SOURCE
+            || sh.host_dir == clone_path
+            || ws_host_dirs.contains(&sh.host_dir.as_path())
+        {
+            continue;
+        }
+        let leaf = sh
+            .guest_path
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("share");
+        let sanitized: String = leaf
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(24)
+            .collect();
+        let tag = format!("mnt{extra_idx}_{sanitized}");
+        let win_mount = if sh.guest_path.as_bytes().get(1) == Some(&b':') {
+            sh.guest_path.replace('/', "\\")
+        } else {
+            format!(r"C:\mnt\{sanitized}")
+        };
+        extra_idx += 1;
+        configs.push(osbx_vmm::ShareConfig {
+            tag: tag.clone(),
+            host_dir: sh.host_dir.clone(),
+            read_only: sh.read_only,
+        });
+        mounts.push((tag, win_mount));
+    }
+
+    (configs, mounts)
+}
+
+/// Windows guest first-boot setup: push the per-sandbox CA PEM, invoke `osbx-agent.exe
+/// --install-ca`, and mount any configured `virtio-fs` shares via `virtiofs.exe` (WinFsp).
+fn first_boot_setup_windows(sb: &Sandbox, ca_pem: &str, mounts: &[(String, String)]) {
     let ps = r#"New-Item -ItemType Directory -Force -Path 'C:\ProgramData\osbx' | Out-Null; [Console]::In.ReadToEnd() | Set-Content -NoNewline -Encoding Ascii 'C:\ProgramData\osbx\ca.pem'; & 'C:\Program Files\osbx\osbx-agent.exe' --install-ca 'C:\ProgramData\osbx\ca.pem'"#;
-    match sb.exec(
-        &["powershell.exe", "-NoProfile", "-Command", ps],
-        Some(ca_pem.as_bytes().to_vec()),
-    ) {
+    let req = ExecRequest {
+        argv: vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            ps.into(),
+        ],
+        user: Some("SYSTEM".into()),
+        ..Default::default()
+    };
+    match sb.exec_request(req, Some(ca_pem.as_bytes().to_vec())) {
         Ok(o) if o.code == 0 => {}
         Ok(o) => eprintln!(
             "windows first-boot CA setup failed ({}): {}",
@@ -650,6 +753,43 @@ fn first_boot_setup_windows(sb: &Sandbox, ca_pem: &str) {
             String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => eprintln!("windows first-boot CA setup failed: {e}"),
+    }
+
+    if mounts.is_empty() {
+        return;
+    }
+    let mut mount_ps = String::from(
+        "$vfs = 'C:\\Program Files\\osbx\\virtiofs.exe'; if (-not (Test-Path $vfs)) { exit 0 }; ",
+    );
+    for (tag, mount_point) in mounts {
+        let tag_esc = tag.replace('\'', "''");
+        let mp_esc = mount_point.replace('\'', "''");
+        // Spawn via WMI Win32_Process.Create so `virtiofs.exe` runs outside the per-exec
+        // KILL_ON_JOB_CLOSE Job Object and remains mounted for the lifetime of the sandbox.
+        mount_ps.push_str(&format!(
+            "$mp = '{mp_esc}'; $par = Split-Path -Parent $mp; if ($par -and -not (Test-Path $par)) {{ New-Item -ItemType Directory -Force -Path $par | Out-Null }}; if (Test-Path $mp) {{ try {{ Remove-Item $mp -Force -ErrorAction Stop }} catch {{}} }}; $cmd = '\"' + $vfs + '\" -t {tag_esc} -m \"' + $mp + '\"'; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = $cmd }} | Out-Null; "
+        ));
+    }
+    // Give virtiofs.exe + WinFsp a moment to register the mount points.
+    mount_ps.push_str("Start-Sleep -Milliseconds 2000");
+    let mreq = ExecRequest {
+        argv: vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            mount_ps,
+        ],
+        user: Some("SYSTEM".into()),
+        ..Default::default()
+    };
+    if let Ok(o) = sb.exec_request(mreq, None)
+        && o.code != 0
+    {
+        eprintln!(
+            "windows virtio-fs mount setup exited {}: {}",
+            o.code,
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
     }
 }
 

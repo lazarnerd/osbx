@@ -10,6 +10,8 @@ mod client;
 mod compose;
 #[cfg(any(target_os = "linux", windows))]
 mod images;
+#[cfg(any(target_os = "linux", windows))]
+mod iso9660;
 mod kits;
 #[cfg(any(target_os = "linux", windows))]
 mod lifecycle;
@@ -86,6 +88,9 @@ struct CreateArgs {
     /// Guest OS (`linux` or `windows`; inferred automatically from Windows templates)
     #[arg(long, value_parser = ["linux", "windows"])]
     os: Option<String>,
+    /// Attach an emulated CRB vTPM 2.0 device (0xFED40000, Windows UEFI guests)
+    #[arg(long)]
+    vtpm: bool,
 }
 
 #[derive(Subcommand)]
@@ -147,6 +152,9 @@ enum Cmd {
         /// Environment variable, KEY=VALUE (repeatable)
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
+        /// Launch in the interactive desktop session (winsta0\default, Windows guests only)
+        #[arg(long)]
+        gui: bool,
         /// Sandbox name
         name: String,
         /// Command and arguments
@@ -229,9 +237,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum WindowsCmd {
-    /// Build a reusable Windows base template unattended from an ISO inside osbx-vmm (Linux/KVM)
+    /// Build a reusable Windows base template unattended from an ISO inside osbx-vmm (Linux/KVM or Windows/WHP)
     BuildBase {
-        /// Windows installation ISO (e.g. Windows Server 2025 Evaluation ISO)
+        /// Windows installation ISO (e.g. Windows Server 2025 Evaluation ISO or Windows 11 ISO)
         #[arg(long)]
         iso: std::path::PathBuf,
         /// Red Hat signed virtio-win.iso
@@ -240,9 +248,12 @@ enum WindowsCmd {
         /// Template name saved under $OSBX_HOME/templates/<name>
         #[arg(long)]
         name: String,
-        /// Image index inside install.wim (1 = Server Standard Core on Server 2025 Eval)
-        #[arg(long, default_value_t = 1)]
-        image_index: u32,
+        /// Edition profile: core (Server Core), desktop (Server Desktop Experience), or win11
+        #[arg(long, default_value = "core", value_parser = ["core", "desktop", "win11"])]
+        profile: String,
+        /// Image index inside install.wim (default: 1 for core/win11, 2 for desktop)
+        #[arg(long)]
+        image_index: Option<u32>,
         /// Virtual QCOW2 disk size in GiB
         #[arg(long, default_value_t = 40)]
         disk_gib: u64,
@@ -261,6 +272,12 @@ enum WindowsCmd {
         /// Path to osbx-agent.exe (auto-detected if omitted)
         #[arg(long)]
         agent_exe: Option<std::path::PathBuf>,
+        /// Path to WinFsp MSI installer (enables in-guest virtio-fs C:\workspace mounts)
+        #[arg(long)]
+        winfsp: Option<std::path::PathBuf>,
+        /// Attach an emulated CRB vTPM 2.0 device during installation (Windows 11)
+        #[arg(long)]
+        vtpm: bool,
         /// Maximum minutes to wait for unattended setup
         #[arg(long, default_value_t = 45)]
         timeout_mins: u64,
@@ -600,6 +617,7 @@ fn create_opts(a: CreateArgs, agent: String) -> lifecycle::CreateOpts {
         workdir: None,
         extra_shares: Vec::new(),
         firewall: None,
+        vtpm: a.vtpm,
     }
 }
 
@@ -629,6 +647,7 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
             user,
             workdir,
             env,
+            gui,
             name,
             command,
         } => {
@@ -637,21 +656,25 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                 .filter_map(|kv| kv.split_once('='))
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
-            // like the agent itself, Linux commands start in the workspace unless told otherwise
+            // Linux commands start in the workspace unless told otherwise; Windows commands start
+            // in an explicit workdir if configured (otherwise osbx-agent.exe defaults to C:\workspace
+            // when mounted).
             let cwd = workdir.or_else(|| {
-                state::Record::load(&name)
-                    .ok()
-                    .filter(|r| r.guest_os == state::GuestOs::Linux)
-                    .and_then(|r| {
+                state::Record::load(&name).ok().and_then(|r| {
+                    if r.guest_os == state::GuestOs::Linux {
                         r.workdir
                             .or_else(|| r.workspace.map(|w| state::guest_path(&w.host)))
-                    })
+                    } else {
+                        r.workdir
+                    }
+                })
             });
             let req = osbx_proto::ExecRequest {
                 argv: command,
                 env,
                 cwd,
                 user,
+                gui,
                 ..Default::default()
             };
             code(client::exec(
@@ -738,6 +761,7 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                     iso,
                     virtio_win,
                     name,
+                    profile,
                     image_index,
                     disk_gib,
                     mem,
@@ -745,21 +769,37 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                     firmware_code,
                     firmware_vars,
                     agent_exe,
+                    winfsp,
+                    vtpm,
                     timeout_mins,
                 },
-        } => done(windows::build_base(&windows::BuildBaseOpts {
-            iso,
-            virtio_win,
-            name,
-            image_index,
-            disk_gib,
-            mem_mib: mem,
-            cpus,
-            firmware_code,
-            firmware_vars,
-            agent_exe,
-            timeout_mins,
-        })),
+        } => {
+            let profile = match windows::WindowsProfile::parse(&profile) {
+                Ok(p) => p,
+                Err(e) => {
+                    return done(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        e,
+                    )));
+                }
+            };
+            done(windows::build_base(&windows::BuildBaseOpts {
+                iso,
+                virtio_win,
+                name,
+                profile,
+                image_index,
+                disk_gib,
+                mem_mib: mem,
+                cpus,
+                firmware_code,
+                firmware_vars,
+                agent_exe,
+                winfsp_msi: winfsp,
+                vtpm,
+                timeout_mins,
+            }))
+        }
         Cmd::Compose {
             opts,
             command: ComposeCmd::Up { detach, sandboxes },

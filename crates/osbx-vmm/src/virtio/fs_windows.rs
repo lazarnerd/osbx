@@ -1,9 +1,7 @@
 //! virtio-fs on hosts without the Linux passthrough file system: the virtio glue around osbx's
 //! own FUSE server ([`crate::fuse`]).
 
-use super::{
-    Activation, GuestMem, INT_USED_RING, Interrupt, SharedQueue, VIRTIO_F_VERSION_1, VirtioDevice,
-};
+use super::{Activation, GuestMem, Interrupt, SharedQueue, VIRTIO_F_VERSION_1, VirtioDevice};
 use crate::fuse::Server;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -64,10 +62,10 @@ impl VirtioDevice for Fs {
         let Some((mem, queues, irq)) = self.active.clone() else {
             return;
         };
-        let Some(queue) = queues.get(queue as usize) else {
+        let Some(q_arc) = queues.get(queue as usize) else {
             return;
         };
-        let mut q = queue.lock().unwrap();
+        let mut q = q_arc.lock().unwrap();
         let mut signal = false;
         while let Ok(iter) = q.iter(&mem) {
             let chains: Vec<_> = iter.collect();
@@ -98,7 +96,7 @@ impl VirtioDevice for Fs {
         }
         if signal && q.needs_notification(&mem).unwrap_or(true) {
             drop(q);
-            irq.signal(INT_USED_RING);
+            irq.signal_queue(queue as u16);
         }
     }
 }

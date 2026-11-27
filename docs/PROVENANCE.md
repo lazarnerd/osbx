@@ -20,3 +20,15 @@ Never copy code, string tables, assets, or branding.
 Where the public docs are silent, the code states the assumption in a doc comment
 tagged `ASSUMPTION:` and a test pins it, so a later black-box check against real `sbx`
 can confirm or correct it. `grep -rn "ASSUMPTION:" crates/` lists them all.
+
+## Third-party guest-only runtime dependencies (Windows sandboxes)
+- **Red Hat `virtio-win` drivers (`viostor`, `viosock`, `viofs`):** Signed Windows guest drivers
+  provided by the user via `--virtio-win <iso>` during `osbx windows build-base`. Licensed under
+  BSD-3-Clause / Apache-2.0; never bundled into or linked with `osbx` binaries.
+- **WinFsp (Windows File System Proxy):** Optional user-supplied MSI (`--winfsp <msi>`) installed
+  inside the Windows guest during template build to back `virtiofs.exe` (`viofs.sys`). WinFsp is
+  licensed under GPLv3 with the FLOSS License Exception (compatible with Apache-2.0). `osbx` does
+  not link against, embed, or redistribute WinFsp; it only invokes the user-supplied installer
+  inside the guest VM.
+- **EDK2 OVMF firmware (`OVMF_CODE_4M.fd`, `OVMF_VARS_4M.fd`):** Loaded at runtime from the host
+  system or `$OSBX_HOME/guest`; licensed under BSD-2-Clause-Patent.
