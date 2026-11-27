@@ -11,17 +11,17 @@ jobs:
           - os: windows-2022
             cargo_scope: --workspace
           # macOS Hypervisor.framework backend not yet implemented: test portable crates + CLI stub.
-          - os: macos-14
+          - os: macos-15
             cargo_scope: --workspace --exclude osbx-sandbox --exclude osbx-image
           # Linux aarch64 VMM backend not yet implemented: test arch-neutral crates + guest agent.
           - os: ubuntu-24.04-arm
             cargo_scope: --workspace --exclude osbx-vmm --exclude osbx-sandbox --exclude osbx-image --exclude osbx-cli
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "clippy, rustfmt" }
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
         shell: bash
       - run: cargo fmt --all --check
