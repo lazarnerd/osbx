@@ -40,10 +40,9 @@ To **upgrade locally** after pulling new commits, re-run `./scripts/build-flatpa
 sandboxes in `~/.var/app/io.github.lazarnerd.osbx/data/osbx`).
 
 To **upgrade via `flatpak update` on any machine**, enable GitHub Pages (Source: GitHub Actions).
-The `flatpak` workflow runs automatically on every merged PR to `main` (as well as `v*` tags and
-manual dispatch), publishing the self-hosted OSTree repo at
-`https://lazarnerd.github.io/osbx/flatpak-repo` and attaching `osbx-<ver>-x86_64.flatpak` to
-GitHub Releases on tags:
+The `flatpak` workflow triggers on version tags (`v*`, e.g. `v0.1.0`) or manual dispatch,
+publishing the self-hosted OSTree repo at `https://lazarnerd.github.io/osbx/flatpak-repo` and
+attaching `osbx-<ver>-x86_64.flatpak` to the GitHub Release:
 
 ```bash
 flatpak remote-add --user --if-not-exists --no-gpg-verify osbx https://lazarnerd.github.io/osbx/flatpak-repo

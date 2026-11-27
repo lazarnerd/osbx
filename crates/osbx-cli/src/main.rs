@@ -1,6 +1,10 @@
 //! `osbx` command line: sandbox lifecycle (Linux/KVM and Windows/WHP hosts), persistent policy and secrets,
 //! and offline tools for policies, kits, sbxenv.yaml and the hypervisor.
 
+// On hosts without a hypervisor backend (e.g. macOS), `kits` and `state` stay compiled so their
+// unit tests run even though `lifecycle`/`supervisor`/`client` are cfg-gated out.
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+
 #[cfg(any(target_os = "linux", windows))]
 mod client;
 #[cfg(any(target_os = "linux", windows))]
