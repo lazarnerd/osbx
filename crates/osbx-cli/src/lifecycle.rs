@@ -1043,9 +1043,9 @@ fn spec_to_create_opts(
         .kits
         .iter()
         .map(|k| match k.kind {
-            osbx_spec::KitSourceKind::Local => {
-                resolve_host_path(base_dir, &k.source).to_string_lossy().into_owned()
-            }
+            osbx_spec::KitSourceKind::Local => resolve_host_path(base_dir, &k.source)
+                .to_string_lossy()
+                .into_owned(),
             osbx_spec::KitSourceKind::Git | osbx_spec::KitSourceKind::Oci => k.source.clone(),
         })
         .collect();
@@ -1197,7 +1197,12 @@ fn ensure_started_spec(
     } else {
         // resource and firewall changes apply to the existing sandbox at its next start
         let mut rec = Record::load(&name)?;
-        let before = (rec.mem_mib, rec.cpus, rec.root_size_mib, rec.firewall.clone());
+        let before = (
+            rec.mem_mib,
+            rec.cpus,
+            rec.root_size_mib,
+            rec.firewall.clone(),
+        );
         if spec.resources.memory_mib.is_some() {
             rec.mem_mib = opts.mem_mib;
         }
@@ -1210,7 +1215,13 @@ fn ensure_started_spec(
         if opts.firewall.is_some() {
             rec.firewall = opts.firewall.clone();
         }
-        if (rec.mem_mib, rec.cpus, rec.root_size_mib, rec.firewall.clone()) != before {
+        if (
+            rec.mem_mib,
+            rec.cpus,
+            rec.root_size_mib,
+            rec.firewall.clone(),
+        ) != before
+        {
             rec.save()?;
             if supervisor::is_running(&name) {
                 eprintln!(
@@ -1241,7 +1252,11 @@ fn ensure_started_spec(
     Ok(name)
 }
 
-fn attach_spec(name: &str, spec: &osbx_spec::SandboxSpec, override_cmd: &[String]) -> io::Result<i32> {
+fn attach_spec(
+    name: &str,
+    spec: &osbx_spec::SandboxSpec,
+    override_cmd: &[String],
+) -> io::Result<i32> {
     let rec = Record::load(name)?;
     let tty = client::is_tty(0) && client::is_tty(1);
     let cmd = if !override_cmd.is_empty() {
@@ -1300,8 +1315,7 @@ pub fn compose_up(
     detach: bool,
     requested: &[String],
 ) -> io::Result<i32> {
-    let loaded =
-        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let loaded = crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
     let selected = crate::compose::select_sandboxes(&loaded.project, profiles, requested)
         .map_err(io::Error::other)?;
     let mut started = Vec::with_capacity(selected.len());
@@ -1329,8 +1343,7 @@ pub fn compose_run(
     sandbox: Option<&str>,
     command: &[String],
 ) -> io::Result<i32> {
-    let loaded =
-        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let loaded = crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
     let req: Vec<String> = sandbox.map(|s| vec![s.to_owned()]).unwrap_or_default();
     let selected = crate::compose::select_sandboxes(&loaded.project, profiles, &req)
         .map_err(io::Error::other)?;
@@ -1357,8 +1370,7 @@ pub fn compose_down(
     remove: bool,
     requested: &[String],
 ) -> io::Result<()> {
-    let loaded =
-        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let loaded = crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
     let selected = crate::compose::select_sandboxes(&loaded.project, profiles, requested)
         .map_err(io::Error::other)?;
     for (key, spec) in selected {
@@ -1385,8 +1397,7 @@ pub fn compose_ps(
     cli_args: &[String],
     no_user_base: bool,
 ) -> io::Result<()> {
-    let loaded =
-        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let loaded = crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
     let active: std::collections::BTreeSet<&str> = loaded
         .project
         .active_sandboxes(profiles)

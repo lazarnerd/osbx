@@ -759,11 +759,10 @@ fn main() -> ExitCode {
                 command: EnvCmd::Run { .. }
             }
             | Cmd::Compose {
-                command:
-                    ComposeCmd::Up { .. }
-                        | ComposeCmd::Run { .. }
-                        | ComposeCmd::Down { .. }
-                        | ComposeCmd::Ps,
+                command: ComposeCmd::Up { .. }
+                    | ComposeCmd::Run { .. }
+                    | ComposeCmd::Down { .. }
+                    | ComposeCmd::Ps,
                 ..
             }
     );
@@ -970,8 +969,7 @@ fn env_config(
     no_user_base: bool,
     json: bool,
 ) -> ExitCode {
-    match load_env_spec(file, env_args, no_user_base)
-        .and_then(|p| compose::format_config(&p, json))
+    match load_env_spec(file, env_args, no_user_base).and_then(|p| compose::format_config(&p, json))
     {
         Ok(s) => {
             print!("{s}");

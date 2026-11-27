@@ -69,10 +69,11 @@ pub fn parse_size_mib(raw: &str) -> Result<u64, SpecError> {
     } else {
         (lower.as_str(), 1)
     };
-    let n: u64 = num_str
-        .trim()
-        .parse()
-        .map_err(|_| SpecError(format!("invalid size {raw:?} (expected e.g. 8G, 512M, or MiB)")))?;
+    let n: u64 = num_str.trim().parse().map_err(|_| {
+        SpecError(format!(
+            "invalid size {raw:?} (expected e.g. 8G, 512M, or MiB)"
+        ))
+    })?;
     if n == 0 {
         return bad(format!("size {raw:?} must be greater than zero"));
     }
@@ -353,7 +354,10 @@ impl KitSpec {
             || source.starts_with('/')
             || source.ends_with(".zip")
             || (source.as_bytes().get(1) == Some(&b':')
-                && source.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
+                && source
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphabetic))
         {
             KitSourceKind::Local
         } else {
@@ -572,7 +576,9 @@ impl std::str::FromStr for SecretBackend {
         match s {
             "sdk" => Ok(Self::Sdk),
             "cli" => Ok(Self::Cli),
-            other => bad(format!("invalid secret backend {other:?} (expected sdk|cli)")),
+            other => bad(format!(
+                "invalid secret backend {other:?} (expected sdk|cli)"
+            )),
         }
     }
 }
@@ -874,10 +880,7 @@ impl ProjectSpec {
     ///
     /// A sandbox with no profiles is always active; a sandbox with profiles is active
     /// when at least one of its profiles appears in `profiles`.
-    pub fn active_sandboxes<'a>(
-        &'a self,
-        profiles: &[String],
-    ) -> Vec<(&'a str, &'a SandboxSpec)> {
+    pub fn active_sandboxes<'a>(&'a self, profiles: &[String]) -> Vec<(&'a str, &'a SandboxSpec)> {
         self.sandboxes
             .iter()
             .filter(|(_, sb)| {

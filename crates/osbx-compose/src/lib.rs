@@ -20,7 +20,8 @@ use std::sync::LazyLock;
 
 pub use osbx_spec;
 
-static NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
+static NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
 
 /// Anything wrong with an `osbx-compose.yml` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,13 +64,19 @@ pub fn parse_dotenv(src: &str) -> Result<BTreeMap<String, String>, ComposeError>
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+        let line = line
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(line);
         let Some((k, v)) = line.split_once('=') else {
             return bad(format!(".env line {}: expected KEY=VALUE", idx + 1));
         };
         let key = k.trim();
         if !NAME_RE.is_match(key) {
-            return bad(format!(".env line {}: invalid variable name {key:?}", idx + 1));
+            return bad(format!(
+                ".env line {}: invalid variable name {key:?}",
+                idx + 1
+            ));
         }
         let v = v.trim();
         let val = if let Some(rest) = v.strip_prefix('"') {
@@ -747,7 +754,9 @@ fn resolve_args(
             (Some(v), _) => v.clone(),
             (None, Some(d)) => d.clone(),
             (None, None) if a.required == Some(true) => {
-                return bad(format!("required arg {n:?} not supplied (use --arg {n}=...)"));
+                return bad(format!(
+                    "required arg {n:?} not supplied (use --arg {n}=...)"
+                ));
             }
             (None, None) => continue,
         };
@@ -828,7 +837,9 @@ fn eval_expr(expr: &str, vars: &BTreeMap<String, String>) -> Result<String, Comp
         .unwrap_or(expr.len());
     let name = &expr[..name_end];
     if name.is_empty() || !NAME_RE.is_match(name) {
-        return bad(format!("invalid variable name in interpolation: ${{{expr}}}"));
+        return bad(format!(
+            "invalid variable name in interpolation: ${{{expr}}}"
+        ));
     }
     let rest = &expr[name_end..];
     let val = vars.get(name);
@@ -921,8 +932,9 @@ fn parse_short_port(raw: &str) -> Result<osbx_spec::PortSpec, ComposeError> {
                 let host: u16 = if h.is_empty() {
                     0
                 } else {
-                    h.parse()
-                        .map_err(|_| ComposeError(format!("port {raw:?}: invalid host port {h:?}")))?
+                    h.parse().map_err(|_| {
+                        ComposeError(format!("port {raw:?}: invalid host port {h:?}"))
+                    })?
                 };
                 (ip.to_owned(), host, *t)
             }
@@ -940,8 +952,9 @@ fn parse_short_port(raw: &str) -> Result<osbx_spec::PortSpec, ComposeError> {
                 let host: u16 = if h.is_empty() {
                     0
                 } else {
-                    h.parse()
-                        .map_err(|_| ComposeError(format!("port {raw:?}: invalid host port {h:?}")))?
+                    h.parse().map_err(|_| {
+                        ComposeError(format!("port {raw:?}: invalid host port {h:?}"))
+                    })?
                 };
                 ("127.0.0.1".to_owned(), host, *t)
             }
@@ -950,8 +963,9 @@ fn parse_short_port(raw: &str) -> Result<osbx_spec::PortSpec, ComposeError> {
                 let host: u16 = if h.is_empty() {
                     0
                 } else {
-                    h.parse()
-                        .map_err(|_| ComposeError(format!("port {raw:?}: invalid host port {h:?}")))?
+                    h.parse().map_err(|_| {
+                        ComposeError(format!("port {raw:?}: invalid host port {h:?}"))
+                    })?
                 };
                 (host_ip, host, *t)
             }
@@ -1181,8 +1195,9 @@ pub fn compile(files: &[&str], ctx: &Context) -> Result<osbx_spec::ProjectSpec, 
 
     // Read declared `args:` before interpolation (args definitions are never interpolated).
     let declared_args: BTreeMap<String, ComposeArg> = match merged.get("args") {
-        Some(v) if !v.is_null() => serde_yaml_ng::from_value(v.clone())
-            .map_err(|e| ComposeError(format!("args: {e}")))?,
+        Some(v) if !v.is_null() => {
+            serde_yaml_ng::from_value(v.clone()).map_err(|e| ComposeError(format!("args: {e}")))?
+        }
         _ => BTreeMap::new(),
     };
     let resolved_args = resolve_args(&declared_args, &ctx.args)?;
@@ -1305,9 +1320,7 @@ fn lower_file(
         let driver = match vdef.driver.as_deref() {
             None | Some("managed") => {
                 if vdef.path.is_some() {
-                    return bad(format!(
-                        "volume {vname:?}: path requires driver: host"
-                    ));
+                    return bad(format!("volume {vname:?}: path requires driver: host"));
                 }
                 osbx_spec::VolumeDriver::Managed
             }
@@ -1538,15 +1551,16 @@ fn lower_file(
                     }
                 }
                 PortEntry::Long(l) => {
-                    let target = u16::try_from(l.target)
-                        .ok()
-                        .filter(|t| *t > 0)
-                        .ok_or_else(|| {
-                            ComposeError(format!(
-                                "sandbox {key:?}: port target {} out of range",
-                                l.target
-                            ))
-                        })?;
+                    let target =
+                        u16::try_from(l.target)
+                            .ok()
+                            .filter(|t| *t > 0)
+                            .ok_or_else(|| {
+                                ComposeError(format!(
+                                    "sandbox {key:?}: port target {} out of range",
+                                    l.target
+                                ))
+                            })?;
                     let host = match l.host {
                         Some(h) => u16::try_from(h).map_err(|_| {
                             ComposeError(format!("sandbox {key:?}: port host {h} out of range"))
@@ -1986,7 +2000,10 @@ sandboxes:
         );
         assert_eq!(dev.firewall.rules.len(), 4);
         assert!(dev.firewall.rules[2].http.is_some());
-        assert_eq!(dev.secrets["anthropic"].bindings.api_key_domains, ["api.anthropic.com"]);
+        assert_eq!(
+            dev.secrets["anthropic"].bindings.api_key_domains,
+            ["api.anthropic.com"]
+        );
         assert!(!dev.secrets["custom"].required);
         assert_eq!(dev.mcp.len(), 1);
         assert_eq!(dev.hooks.initialize.len(), 1);

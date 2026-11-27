@@ -755,7 +755,9 @@ impl EnvFile {
             Some("always") => Some(osbx_spec::PullPolicy::Always),
             Some("missing") => Some(osbx_spec::PullPolicy::Missing),
             Some("never") => Some(osbx_spec::PullPolicy::Never),
-            Some(other) => return bad(format!("pullPolicy {other:?} must be always|missing|never")),
+            Some(other) => {
+                return bad(format!("pullPolicy {other:?} must be always|missing|never"));
+            }
         };
 
         let skills = match self.sandbox_options.skills.as_deref() {
@@ -809,7 +811,9 @@ impl EnvFile {
             let target = u16::try_from(p.sandbox)
                 .map_err(|_| EnvError(format!("port.sandbox {} out of range", p.sandbox)))?;
             let host = match p.host {
-                Some(h) => u16::try_from(h).map_err(|_| EnvError("port.host out of range".into()))?,
+                Some(h) => {
+                    u16::try_from(h).map_err(|_| EnvError("port.host out of range".into()))?
+                }
                 None => 0,
             };
             let protocol = match p.protocol.as_deref() {
@@ -1210,7 +1214,10 @@ lifecycle:
         assert_eq!(sb.resources.disks.docker_mib, Some(20 * 1024));
         assert_eq!(sb.resources.disks.cloned_workspace_mib, Some(10 * 1024));
         assert_eq!(sb.pull_policy, Some(osbx_spec::PullPolicy::Missing));
-        assert_eq!(sb.agent_options.skills, Some(osbx_spec::SkillsMode::Readonly));
+        assert_eq!(
+            sb.agent_options.skills,
+            Some(osbx_spec::SkillsMode::Readonly)
+        );
         assert_eq!(sb.capabilities.nested, Some(true));
         assert_eq!(sb.capabilities.usb, ["1234:5678"]);
         assert_eq!(

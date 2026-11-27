@@ -345,7 +345,10 @@ pub fn supervise(name: &str) -> io::Result<()> {
     }
     // extra bind mounts / named volumes from osbx-compose.yml or sbxenv.yaml
     for s in &rec.extra_shares {
-        if shares.iter().any(|existing| existing.guest_path == s.guest_path) {
+        if shares
+            .iter()
+            .any(|existing| existing.guest_path == s.guest_path)
+        {
             continue;
         }
         std::fs::create_dir_all(&s.host_dir)?;

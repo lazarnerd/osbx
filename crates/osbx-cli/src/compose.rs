@@ -130,7 +130,11 @@ pub fn select_sandboxes<'a>(
 }
 
 /// Resolve the runtime sandbox name for a compose sandbox entry.
-pub fn runtime_name(project_name: Option<&str>, key: &str, spec: &osbx_spec::SandboxSpec) -> String {
+pub fn runtime_name(
+    project_name: Option<&str>,
+    key: &str,
+    spec: &osbx_spec::SandboxSpec,
+) -> String {
     if let Some(explicit) = &spec.name {
         return explicit.clone();
     }
@@ -202,7 +206,10 @@ pub fn format_plan(project: &osbx_spec::ProjectSpec, profiles: &[String]) -> Str
             out += &format!("  mount [{:?}]: {} -> {}{ro}\n", m.kind, m.source, m.target);
         }
         for k in &sb.kits {
-            out += &format!("  kit: {} -> handle {:?} ({:?})\n", k.source, k.handle, k.kind);
+            out += &format!(
+                "  kit: {} -> handle {:?} ({:?})\n",
+                k.source, k.handle, k.kind
+            );
             for (guest, host) in &k.mounts {
                 out += &format!("    kit mount: {host} -> {guest}\n");
             }
@@ -260,9 +267,18 @@ mod tests {
             &osbx_compose::Context::default(),
         )
         .unwrap();
-        assert_eq!(runtime_name(p.name.as_deref(), "dev", &p.sandboxes["dev"]), "demo-dev");
-        assert_eq!(runtime_name(p.name.as_deref(), "demo", &p.sandboxes["demo"]), "demo");
-        assert_eq!(runtime_name(p.name.as_deref(), "custom", &p.sandboxes["custom"]), "exact");
+        assert_eq!(
+            runtime_name(p.name.as_deref(), "dev", &p.sandboxes["dev"]),
+            "demo-dev"
+        );
+        assert_eq!(
+            runtime_name(p.name.as_deref(), "demo", &p.sandboxes["demo"]),
+            "demo"
+        );
+        assert_eq!(
+            runtime_name(p.name.as_deref(), "custom", &p.sandboxes["custom"]),
+            "exact"
+        );
     }
 
     #[test]
