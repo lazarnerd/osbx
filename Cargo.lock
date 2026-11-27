@@ -841,6 +841,7 @@ version = "0.0.2"
 dependencies = [
  "clap",
  "libc",
+ "osbx-compose",
  "osbx-env",
  "osbx-image",
  "osbx-kit",
@@ -849,6 +850,7 @@ dependencies = [
  "osbx-proxy",
  "osbx-sandbox",
  "osbx-secrets",
+ "osbx-spec",
  "osbx-vmm",
  "serde",
  "serde_json",
@@ -860,9 +862,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "osbx-compose"
+version = "0.0.2"
+dependencies = [
+ "osbx-spec",
+ "regex",
+ "serde",
+ "serde_yaml_ng",
+]
+
+[[package]]
 name = "osbx-env"
 version = "0.0.2"
 dependencies = [
+ "osbx-spec",
  "regex",
  "serde",
  "serde_yaml_ng",
@@ -950,6 +963,14 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
+]
+
+[[package]]
+name = "osbx-spec"
+version = "0.0.2"
+dependencies = [
+ "osbx-policy",
+ "serde",
 ]
 
 [[package]]

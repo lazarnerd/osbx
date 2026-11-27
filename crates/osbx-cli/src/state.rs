@@ -143,6 +143,18 @@ pub struct Workspace {
     pub mode: WorkspaceMode,
 }
 
+/// An additional host-directory share (bind mount or named volume).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredShare {
+    /// Absolute host directory.
+    pub host_dir: PathBuf,
+    /// Absolute path inside the guest.
+    pub guest_path: String,
+    /// Mount read-only inside the guest.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// Launch settings taken from the image config.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
@@ -190,6 +202,15 @@ pub struct Record {
     /// Host directories chosen for kit host-mount paths (sandbox path -> host dir).
     #[serde(default)]
     pub mounts: BTreeMap<String, PathBuf>,
+    /// Explicit guest working directory (e.g. `workspace: /workspace` in `osbx-compose.yml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Additional host directory / named volume shares mounted into the guest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_shares: Vec<StoredShare>,
+    /// Optional per-sandbox egress firewall (preset override + allow/deny/HTTP rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firewall: Option<osbx_spec::FirewallSpec>,
     /// Unix seconds.
     pub created: u64,
 }

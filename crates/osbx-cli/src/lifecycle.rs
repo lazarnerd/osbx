@@ -2,8 +2,8 @@
 
 use crate::client::{self, Attach};
 use crate::state::{
-    Launch, Record, StoredPolicy, StoredRule, Workspace, WorkspaceMode, assets_dir, check_name,
-    home, sandbox_dir,
+    Launch, Record, StoredPolicy, StoredRule, StoredShare, Workspace, WorkspaceMode, assets_dir,
+    check_name, home, sandbox_dir,
 };
 use crate::supervisor;
 use osbx_proto::ExecRequest;
@@ -228,6 +228,12 @@ pub struct CreateOpts {
     pub root_size_mib: Option<u64>,
     /// Host directories for kit host-mount paths (sandbox path -> host dir).
     pub mounts: BTreeMap<String, PathBuf>,
+    /// Explicit guest working directory (e.g. `workspace: /workspace` in compose).
+    pub workdir: Option<String>,
+    /// Additional bind mounts / named volumes.
+    pub extra_shares: Vec<StoredShare>,
+    /// Optional per-sandbox egress firewall.
+    pub firewall: Option<osbx_spec::FirewallSpec>,
 }
 
 fn default_name(agent: &str, ws: Option<&Path>) -> String {
@@ -430,6 +436,9 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
         kits,
         docker: o.docker,
         mounts: o.mounts.clone(),
+        workdir: o.workdir.clone(),
+        extra_shares: o.extra_shares.clone(),
+        firewall: o.firewall.clone(),
         launch,
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -574,10 +583,14 @@ pub fn agent_request(rec: &Record, extra: &[String]) -> ExecRequest {
     } else {
         extra.to_vec()
     };
-    let cwd = match &rec.workspace {
-        Some(w) => Some(crate::state::guest_path(&w.host)),
-        None if !rec.launch.workdir.is_empty() => Some(rec.launch.workdir.clone()),
-        None => None,
+    let cwd = if let Some(wd) = &rec.workdir {
+        Some(wd.clone())
+    } else {
+        match &rec.workspace {
+            Some(w) => Some(crate::state::guest_path(&w.host)),
+            None if !rec.launch.workdir.is_empty() => Some(rec.launch.workdir.clone()),
+            None => None,
+        }
     };
     // sbx@1: the host launches the agent under bash so the persistent environment file is sourced
     let (argv, env) = if crate::kits::sbx_platform(&rec.kits) {
@@ -978,137 +991,230 @@ pub fn secret_bindings() -> io::Result<()> {
     Ok(())
 }
 
-// ---- sbxenv.yaml -------------------------------------------------------------------------
+// ---- compiled spec runner (shared by `osbx env` and `osbx compose`) ----------------------
 
-/// Parse `"16g"`, `"512m"`, `"2048"` (MiB) into MiB.
-pub fn parse_mem(s: &str) -> Option<usize> {
-    let s = s.trim().to_ascii_lowercase();
-    let (num, mult) = match s.chars().last()? {
-        'g' => (&s[..s.len() - 1], 1024),
-        'm' => (&s[..s.len() - 1], 1),
-        _ => (s.as_str(), 1),
-    };
-    num.parse::<usize>().ok().map(|n| n * mult)
+fn resolve_host_path(base_dir: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base_dir.join(p)
+    }
 }
 
-/// `osbx env run [FILE]`: create/start the environment's sandbox and attach.
-pub fn env_run(file: &Path, env_args: &[String], detach: bool) -> io::Result<i32> {
-    let text = std::fs::read_to_string(file)?;
-    let dir = crate::state::plain_path(&std::fs::canonicalize(
-        file.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?);
-    let mut args = BTreeMap::new();
-    for a in env_args {
-        let (k, v) = a
-            .split_once('=')
-            .ok_or_else(|| io::Error::other(format!("--env-arg {a}: expected name=value")))?;
-        args.insert(k.to_owned(), v.to_owned());
+fn run_host_hooks(hooks: &[osbx_spec::HostCommandSpec], default_dir: &Path) -> io::Result<()> {
+    for h in hooks {
+        let label = h.name.as_deref().unwrap_or(&h.command);
+        let workdir = h
+            .workdir
+            .as_deref()
+            .map(|w| resolve_host_path(default_dir, w))
+            .unwrap_or_else(|| default_dir.to_path_buf());
+        eprintln!("hook: {label}");
+        let status = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", &h.command])
+                .current_dir(&workdir)
+                .status()?
+        } else {
+            Command::new("sh")
+                .args(["-c", &h.command])
+                .current_dir(&workdir)
+                .status()?
+        };
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "host hook {label:?} failed ({status})"
+            )));
+        }
     }
-    let ctx = osbx_env::Context {
-        project_dir: dir.to_string_lossy().into(),
-        file_dir: dir.to_string_lossy().into(),
-        args,
-    };
-    let e = osbx_env::load(&[&text], &ctx).map_err(|e| io::Error::other(e.to_string()))?;
-    // kits: local sources resolve against the file's directory
-    let kit_sources: Vec<String> = e
+    Ok(())
+}
+
+/// Convert a compiled [`osbx_spec::SandboxSpec`] into [`CreateOpts`] + resolved runtime name.
+fn spec_to_create_opts(
+    project: &osbx_spec::ProjectSpec,
+    key: &str,
+    spec: &osbx_spec::SandboxSpec,
+    base_dir: &Path,
+    explicit_runtime_name: Option<String>,
+) -> io::Result<(String, CreateOpts)> {
+    let kit_sources: Vec<String> = spec
         .kits
         .iter()
-        .map(|k| match k.kind() {
-            osbx_env::KitSource::Local(p) => dir.join(p).to_string_lossy().into_owned(),
-            osbx_env::KitSource::Git(g) => g,
-            osbx_env::KitSource::Oci(r) => r,
+        .map(|k| match k.kind {
+            osbx_spec::KitSourceKind::Local => {
+                resolve_host_path(base_dir, &k.source).to_string_lossy().into_owned()
+            }
+            osbx_spec::KitSourceKind::Git | osbx_spec::KitSourceKind::Oci => k.source.clone(),
         })
         .collect();
-    if let Some(k) = e
+    if let Some(k) = spec
         .kits
         .iter()
-        .find(|k| matches!(k.kind(), osbx_env::KitSource::Git(_)))
+        .find(|k| k.kind == osbx_spec::KitSourceKind::Git)
     {
         return Err(io::Error::other(format!(
             "git kit sources are not supported yet: {}",
-            k.source()
+            k.source
         )));
     }
-    let mut env_kit_args = Vec::new();
-    for k in &e.kits {
-        if let osbx_env::KitEntry::Full(f) = k {
-            let handle = k.handle();
-            for (arg, val) in &f.args {
-                env_kit_args.push(format!("{handle}.{arg}={val}"));
+    let mut kit_args = Vec::new();
+    for k in &spec.kits {
+        for (arg, val) in &k.args {
+            kit_args.push(format!("{}.{arg}={val}", k.handle));
+        }
+    }
+
+    let (mut ws, mut clone) = match &spec.workspace {
+        None => (None, false),
+        Some(w) => (
+            Some(resolve_host_path(base_dir, &w.host_path)),
+            w.mode == osbx_spec::WorkspaceMode::Clone,
+        ),
+    };
+
+    let mut mounts = BTreeMap::new();
+    let mut extra_shares = Vec::new();
+    let project_prefix = project.name.as_deref().unwrap_or("default");
+
+    // Kit-scoped `mounts:` entries
+    for k in &spec.kits {
+        for (guest, host) in &k.mounts {
+            mounts.insert(guest.clone(), resolve_host_path(base_dir, host));
+        }
+    }
+
+    for m in &spec.mounts {
+        match m.kind {
+            osbx_spec::MountKind::KitMount => {
+                mounts.insert(m.target.clone(), resolve_host_path(base_dir, &m.source));
+            }
+            osbx_spec::MountKind::Bind => {
+                let host_dir = resolve_host_path(base_dir, &m.source);
+                // Also register under `mounts` so if a kit declares `host-mount@1` at `m.target`,
+                // it uses this host directory instead of an app-data default.
+                mounts
+                    .entry(m.target.clone())
+                    .or_insert_with(|| host_dir.clone());
+                extra_shares.push(StoredShare {
+                    host_dir,
+                    guest_path: m.target.clone(),
+                    read_only: m.read_only,
+                });
+            }
+            osbx_spec::MountKind::Volume => {
+                let host_dir = match project.volumes.get(&m.source).map(|v| &v.driver) {
+                    Some(osbx_spec::VolumeDriver::Host { path }) => {
+                        resolve_host_path(base_dir, path)
+                    }
+                    _ => home()
+                        .join("volumes")
+                        .join(format!("{project_prefix}_{}", m.source)),
+                };
+                extra_shares.push(StoredShare {
+                    host_dir,
+                    guest_path: m.target.clone(),
+                    read_only: m.read_only,
+                });
+            }
+            osbx_spec::MountKind::Clone => {
+                let host_dir = resolve_host_path(base_dir, &m.source);
+                if ws.is_none() {
+                    ws = Some(host_dir);
+                    clone = true;
+                } else {
+                    return Err(io::Error::other(format!(
+                        "sandbox {key:?}: only one :clone repository per sandbox is currently supported"
+                    )));
+                }
             }
         }
     }
-    let (ws, clone) = match &e.workspace {
-        None => (None, false),
-        Some(osbx_env::Workspace::Path(p)) => (Some(dir.join(p)), false),
-        Some(osbx_env::Workspace::Full { path, clone }) => (Some(dir.join(path)), *clone),
-    };
+
+    let mem_mib = spec
+        .resources
+        .memory_mib
+        .and_then(|m| usize::try_from(m).ok())
+        .unwrap_or(2048);
+    let cpus = spec
+        .resources
+        .cpus
+        .filter(|c| *c > 0)
+        .map_or(2, |c| u8::try_from(c.min(32)).unwrap_or(32));
+    let kvm = spec.capabilities.kvm.is_some_and(|c| c.enabled);
+    let docker = spec.capabilities.docker.is_some_and(|c| c.enabled);
+    let firewall = (spec.firewall.default.is_some() || !spec.firewall.rules.is_empty())
+        .then(|| spec.firewall.clone());
+
     let opts = CreateOpts {
-        agent: e.agent.clone(),
-        image: e.sandbox_options.template.clone(),
-        name: e.name.clone(),
+        agent: spec.agent.clone(),
+        image: spec.image.clone(),
+        name: explicit_runtime_name.clone().or_else(|| spec.name.clone()),
         no_workspace: ws.is_none(),
         workspace: ws,
         clone,
-        env: e.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
-        mem_mib: e
-            .sandbox_options
-            .memory
-            .as_deref()
-            .and_then(parse_mem)
-            .unwrap_or(2048),
-        cpus: e
-            .sandbox_options
-            .cpus
-            .filter(|c| *c > 0)
-            .map_or(2, |c| u8::try_from(c.min(32)).unwrap_or(32)),
+        env: spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        mem_mib,
+        cpus,
         kits: kit_sources,
-        kit_args: env_kit_args,
-        kvm: false,
-        docker: false,
-        template: None,
-        root_size_mib: e
-            .sandbox_options
-            .root_size
-            .as_deref()
-            .and_then(parse_mem)
-            .map(|m| m as u64),
-        mounts: e
-            .mounts
-            .iter()
-            .map(|(k, v)| (k.clone(), PathBuf::from(v)))
-            .collect(),
+        kit_args,
+        kvm,
+        docker,
+        template: spec.template.clone(),
+        root_size_mib: spec.resources.disks.root_mib,
+        mounts,
+        workdir: spec.workdir.clone(),
+        extra_shares,
+        firewall,
     };
+
     let name = opts
         .name
         .clone()
         .unwrap_or_else(|| default_name(&opts.agent, opts.workspace.as_deref()));
-    if !sandbox_dir(&name).join("sandbox.json").exists() {
+    Ok((name, opts))
+}
+
+/// Ensure a sandbox from [`osbx_spec::SandboxSpec`] exists, apply resource/firewall updates,
+/// start it, and publish declared ports. Returns the runtime sandbox name.
+fn ensure_started_spec(
+    project: &osbx_spec::ProjectSpec,
+    key: &str,
+    spec: &osbx_spec::SandboxSpec,
+    base_dir: &Path,
+    explicit_runtime_name: Option<String>,
+) -> io::Result<String> {
+    run_host_hooks(&spec.hooks.initialize, base_dir)?;
+    let (name, opts) = spec_to_create_opts(project, key, spec, base_dir, explicit_runtime_name)?;
+    let existed = sandbox_dir(&name).join("sandbox.json").exists();
+    if !existed {
         create(&CreateOpts {
             name: Some(name.clone()),
             ..opts
         })?;
+        run_host_hooks(&spec.hooks.post_create, base_dir)?;
     } else {
-        // resources stated in the file apply to the existing sandbox at its next start
+        // resource and firewall changes apply to the existing sandbox at its next start
         let mut rec = Record::load(&name)?;
-        let before = (rec.mem_mib, rec.cpus, rec.root_size_mib);
-        if e.sandbox_options.memory.is_some() {
+        let before = (rec.mem_mib, rec.cpus, rec.root_size_mib, rec.firewall.clone());
+        if spec.resources.memory_mib.is_some() {
             rec.mem_mib = opts.mem_mib;
         }
-        if e.sandbox_options.cpus.is_some() {
+        if spec.resources.cpus.is_some() {
             rec.cpus = opts.cpus;
         }
         if opts.root_size_mib.is_some() {
             rec.root_size_mib = opts.root_size_mib;
         }
-        if (rec.mem_mib, rec.cpus, rec.root_size_mib) != before {
+        if opts.firewall.is_some() {
+            rec.firewall = opts.firewall.clone();
+        }
+        if (rec.mem_mib, rec.cpus, rec.root_size_mib, rec.firewall.clone()) != before {
             rec.save()?;
             if supervisor::is_running(&name) {
                 eprintln!(
-                    "note: resources changed (memory {} MiB, {} vCPUs, disk {}); they apply after `osbx stop {name}`",
+                    "note: resources/firewall changed (memory {} MiB, {} vCPUs, disk {}); they apply after `osbx stop {name}`",
                     rec.mem_mib,
                     rec.cpus,
                     rec.root_size_mib
@@ -1118,41 +1224,201 @@ pub fn env_run(file: &Path, env_args: &[String], detach: bool) -> io::Result<i32
         }
     }
     start(&name)?;
-    for p in &e.ports {
-        let host = format!(
-            "{}:{}",
-            p.host_ip
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("127.0.0.1"),
-            p.host.unwrap_or(0)
-        );
+    for p in &spec.ports {
+        let host = format!("{}:{}", p.host_ip, p.host);
         match supervisor::request(
             &name,
-            json!({"op": "publish", "host": host, "guest": p.sandbox}),
+            json!({"op": "publish", "host": host, "guest": p.target}),
         ) {
             Ok(v) => eprintln!(
                 "published {} -> sandbox port {}",
                 v["host"].as_str().unwrap_or("?"),
-                p.sandbox
+                p.target
             ),
-            Err(err) => eprintln!("warning: port {}: {err}", p.sandbox),
+            Err(err) => eprintln!("warning: port {}: {err}", p.target),
         }
     }
-    if detach {
-        return Ok(0);
-    }
-    let rec = Record::load(&name)?;
+    Ok(name)
+}
+
+fn attach_spec(name: &str, spec: &osbx_spec::SandboxSpec, override_cmd: &[String]) -> io::Result<i32> {
+    let rec = Record::load(name)?;
     let tty = client::is_tty(0) && client::is_tty(1);
-    let mut req = agent_request(&rec, &e.cmd.clone().unwrap_or_default());
-    if let Some(ep) = &e.entrypoint {
+    let cmd = if !override_cmd.is_empty() {
+        override_cmd.to_vec()
+    } else {
+        spec.command.clone().unwrap_or_default()
+    };
+    let mut req = agent_request(&rec, &cmd);
+    if override_cmd.is_empty()
+        && let Some(ep) = &spec.entrypoint
+    {
         req.argv = ep
             .iter()
             .cloned()
             .chain(req.argv.into_iter().skip(rec.launch.argv.len().min(1)))
             .collect();
     }
-    client::exec(&name, req, Attach { stdin: true, tty })
+    client::exec(name, req, Attach { stdin: true, tty })
+}
+
+/// `osbx env run [FILE]`: compile `sbxenv.yaml` into [`osbx_spec::ProjectSpec`], create/start
+/// its sandbox, and attach unless `detach` is set.
+pub fn env_run(file: &Path, env_args: &[String], detach: bool) -> io::Result<i32> {
+    let text = std::fs::read_to_string(file)?;
+    let dir = crate::state::plain_path(&std::fs::canonicalize(
+        file.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?);
+    let args = crate::compose::parse_kv_args(env_args, "--env-arg").map_err(io::Error::other)?;
+    let ctx = osbx_env::Context {
+        project_dir: dir.to_string_lossy().into(),
+        file_dir: dir.to_string_lossy().into(),
+        args,
+    };
+    let project = osbx_env::compile(&[&text], &ctx).map_err(|e| io::Error::other(e.to_string()))?;
+    let (key, spec) = project
+        .sandboxes
+        .iter()
+        .next()
+        .ok_or_else(|| io::Error::other("sbxenv.yaml produced no sandbox"))?;
+    let name = ensure_started_spec(&project, key, spec, &dir, spec.name.clone())?;
+    if detach {
+        return Ok(0);
+    }
+    attach_spec(&name, spec, &[])
+}
+
+/// `osbx compose up`: create & start selected sandboxes from `osbx-compose.yml`.
+/// Attaches automatically if a single sandbox is selected and `detach` is `false`.
+pub fn compose_up(
+    files: &[PathBuf],
+    profiles: &[String],
+    cli_args: &[String],
+    no_user_base: bool,
+    detach: bool,
+    requested: &[String],
+) -> io::Result<i32> {
+    let loaded =
+        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let selected = crate::compose::select_sandboxes(&loaded.project, profiles, requested)
+        .map_err(io::Error::other)?;
+    let mut started = Vec::with_capacity(selected.len());
+    for (key, spec) in &selected {
+        let rname = crate::compose::runtime_name(loaded.project.name.as_deref(), key, spec);
+        let name = ensure_started_spec(&loaded.project, key, spec, &loaded.dir, Some(rname))?;
+        started.push((name, *spec));
+    }
+    if detach || started.len() != 1 {
+        for (name, _) in &started {
+            println!("{name}");
+        }
+        return Ok(0);
+    }
+    let (name, spec) = &started[0];
+    attach_spec(name, spec, &[])
+}
+
+/// `osbx compose run [SANDBOX] [-- CMD...]`: create/start one sandbox and attach (or run `CMD`).
+pub fn compose_run(
+    files: &[PathBuf],
+    profiles: &[String],
+    cli_args: &[String],
+    no_user_base: bool,
+    sandbox: Option<&str>,
+    command: &[String],
+) -> io::Result<i32> {
+    let loaded =
+        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let req: Vec<String> = sandbox.map(|s| vec![s.to_owned()]).unwrap_or_default();
+    let selected = crate::compose::select_sandboxes(&loaded.project, profiles, &req)
+        .map_err(io::Error::other)?;
+    if selected.len() != 1 {
+        let keys: Vec<&str> = selected.iter().map(|(k, _)| *k).collect();
+        return Err(io::Error::other(format!(
+            "compose run requires a single sandbox; specify one of: {}",
+            keys.join(", ")
+        )));
+    }
+    let (key, spec) = selected[0];
+    let rname = crate::compose::runtime_name(loaded.project.name.as_deref(), key, spec);
+    let name = ensure_started_spec(&loaded.project, key, spec, &loaded.dir, Some(rname))?;
+    attach_spec(&name, spec, command)
+}
+
+/// `osbx compose down [--rm] [SANDBOX...]`: stop (and optionally remove) sandboxes from
+/// `osbx-compose.yml`.
+pub fn compose_down(
+    files: &[PathBuf],
+    profiles: &[String],
+    cli_args: &[String],
+    no_user_base: bool,
+    remove: bool,
+    requested: &[String],
+) -> io::Result<()> {
+    let loaded =
+        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let selected = crate::compose::select_sandboxes(&loaded.project, profiles, requested)
+        .map_err(io::Error::other)?;
+    for (key, spec) in selected {
+        let name = crate::compose::runtime_name(loaded.project.name.as_deref(), key, spec);
+        if !sandbox_dir(&name).join("sandbox.json").exists() {
+            continue;
+        }
+        if remove {
+            run_host_hooks(&spec.hooks.pre_remove, &loaded.dir)?;
+            rm(&name, true)?;
+            eprintln!("removed {name}");
+        } else {
+            stop(&name)?;
+            eprintln!("stopped {name}");
+        }
+    }
+    Ok(())
+}
+
+/// `osbx compose ps`: show status of sandboxes defined in `osbx-compose.yml`.
+pub fn compose_ps(
+    files: &[PathBuf],
+    profiles: &[String],
+    cli_args: &[String],
+    no_user_base: bool,
+) -> io::Result<()> {
+    let loaded =
+        crate::compose::load(files, cli_args, no_user_base).map_err(io::Error::other)?;
+    let active: std::collections::BTreeSet<&str> = loaded
+        .project
+        .active_sandboxes(profiles)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    println!(
+        "{:<18} {:<24} {:<10} {:<10} PROFILE",
+        "SANDBOX", "NAME", "AGENT", "STATUS"
+    );
+    for (key, spec) in &loaded.project.sandboxes {
+        let name = crate::compose::runtime_name(loaded.project.name.as_deref(), key, spec);
+        let status = if !sandbox_dir(&name).join("sandbox.json").exists() {
+            "not created"
+        } else if supervisor::is_running(&name) {
+            "running"
+        } else {
+            "stopped"
+        };
+        let prof = if spec.profiles.is_empty() {
+            "-".to_owned()
+        } else if active.contains(key.as_str()) {
+            format!("{} (active)", spec.profiles.join(","))
+        } else {
+            spec.profiles.join(",")
+        };
+        println!(
+            "{:<18} {:<24} {:<10} {:<10} {}",
+            key, name, spec.agent, status, prof
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1169,9 +1435,6 @@ mod tests {
         assert_eq!(image_for("shell"), "ubuntu:24.04");
         assert_eq!(image_for("debian:12"), "debian:12");
         assert_eq!(image_for("claude"), "docker.io/sbx/claude:latest");
-        assert_eq!(parse_mem("16g"), Some(16384));
-        assert_eq!(parse_mem("512m"), Some(512));
-        assert_eq!(parse_mem("x"), None);
     }
 
     #[test]
@@ -1198,6 +1461,9 @@ mod tests {
             kits: vec![],
             docker: false,
             mounts: BTreeMap::new(),
+            workdir: None,
+            extra_shares: vec![],
+            firewall: None,
         };
         let r = agent_request(&rec, &[]);
         assert_eq!(

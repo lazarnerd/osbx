@@ -14,19 +14,10 @@ use serde_yaml_ng::{Mapping, Value};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
+pub use osbx_spec;
+
 /// Agents the runtime ships as built-ins.
-pub const BUILTIN_AGENTS: &[&str] = &[
-    "claude",
-    "codex",
-    "copilot",
-    "cursor",
-    "devin",
-    "docker-agent",
-    "droid",
-    "kiro",
-    "opencode",
-    "shell",
-];
+pub const BUILTIN_AGENTS: &[&str] = osbx_spec::BUILTIN_AGENTS;
 
 static REF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$\{\{\s*env\.([A-Za-z]+)(?:\.([A-Za-z_][A-Za-z0-9_]*))?\s*\}\}").unwrap()
@@ -668,6 +659,291 @@ impl SecretSpec {
     pub fn is_literal(&self) -> bool {
         self.value.is_some()
     }
+
+    fn to_spec(&self, name: &str) -> Result<osbx_spec::SecretValueSpec, EnvError> {
+        self.check(name)?;
+        let source = if let Some(v) = &self.value {
+            osbx_spec::SecretSource::Value(v.clone())
+        } else if let Some(r) = &self.reference {
+            osbx_spec::SecretSource::Ref(r.clone())
+        } else if let Some(c) = &self.command {
+            osbx_spec::SecretSource::Command(c.clone())
+        } else {
+            return bad(format!(
+                "secret {name:?}: exactly one of value/ref/command is required"
+            ));
+        };
+        let backend = self
+            .backend
+            .as_deref()
+            .map(|b| b.parse::<osbx_spec::SecretBackend>())
+            .transpose()
+            .map_err(|e| EnvError(format!("secret {name:?}: {e}")))?;
+        Ok(osbx_spec::SecretValueSpec {
+            source,
+            no_verify: self.no_verify.unwrap_or(false),
+            refresh: self.refresh.clone(),
+            backend,
+            snapshot: self.snapshot.unwrap_or(false),
+        })
+    }
+}
+
+/// Parse, validate, and compile one or more layered `sbxenv.yaml` files into the canonical
+/// [`osbx_spec::ProjectSpec`] IR.
+pub fn compile(files: &[&str], ctx: &Context) -> Result<osbx_spec::ProjectSpec, EnvError> {
+    load(files, ctx)?.compile()
+}
+
+impl EnvFile {
+    /// Compile this validated `sbxenv.yaml` into the canonical [`osbx_spec::ProjectSpec`] IR.
+    pub fn compile(&self) -> Result<osbx_spec::ProjectSpec, EnvError> {
+        let workspace = self.workspace.as_ref().map(|w| match w {
+            Workspace::Path(p) => osbx_spec::WorkspaceSpec {
+                host_path: p.clone(),
+                guest_path: None,
+                mode: osbx_spec::WorkspaceMode::Direct,
+            },
+            Workspace::Full { path, clone } => osbx_spec::WorkspaceSpec {
+                host_path: path.clone(),
+                guest_path: None,
+                mode: if *clone {
+                    osbx_spec::WorkspaceMode::Clone
+                } else {
+                    osbx_spec::WorkspaceMode::Direct
+                },
+            },
+        });
+
+        let mut mounts = Vec::new();
+        for extra in &self.additional_workspaces {
+            let target = extra.target.clone().unwrap_or_else(|| extra.path.clone());
+            mounts.push(osbx_spec::MountSpec {
+                kind: osbx_spec::MountKind::Bind,
+                source: extra.path.clone(),
+                target,
+                read_only: extra.read_only.unwrap_or(false),
+                mode: None,
+                kit: None,
+            });
+        }
+        for (sandbox_path, host_path) in &self.mounts {
+            mounts.push(osbx_spec::MountSpec {
+                kind: osbx_spec::MountKind::KitMount,
+                source: host_path.clone(),
+                target: sandbox_path.clone(),
+                read_only: false,
+                mode: None,
+                kit: None,
+            });
+        }
+
+        let kits = self
+            .kits
+            .iter()
+            .map(|k| {
+                let args = match k {
+                    KitEntry::Ref(_) => BTreeMap::new(),
+                    KitEntry::Full(f) => f.args.clone(),
+                };
+                osbx_spec::KitSpec::from_source(k.source(), None, args, BTreeMap::new())
+            })
+            .collect();
+
+        let pull_policy = match self.sandbox_options.pull_policy.as_deref() {
+            None => None,
+            Some("always") => Some(osbx_spec::PullPolicy::Always),
+            Some("missing") => Some(osbx_spec::PullPolicy::Missing),
+            Some("never") => Some(osbx_spec::PullPolicy::Never),
+            Some(other) => return bad(format!("pullPolicy {other:?} must be always|missing|never")),
+        };
+
+        let skills = match self.sandbox_options.skills.as_deref() {
+            None => None,
+            Some("off") => Some(osbx_spec::SkillsMode::Off),
+            Some("readonly") => Some(osbx_spec::SkillsMode::Readonly),
+            Some("readwrite") => Some(osbx_spec::SkillsMode::Readwrite),
+            Some(other) => return bad(format!("skills {other:?} must be off|readonly|readwrite")),
+        };
+
+        let parse_opt_size = |field: &str, v: Option<&str>| -> Result<Option<u64>, EnvError> {
+            v.map(|s| {
+                osbx_spec::parse_size_mib(s)
+                    .map_err(|e| EnvError(format!("sandboxOptions.{field}: {e}")))
+            })
+            .transpose()
+        };
+
+        let resources = osbx_spec::ResourcesSpec {
+            cpus: self.sandbox_options.cpus,
+            memory_mib: parse_opt_size("memory", self.sandbox_options.memory.as_deref())?,
+            disks: osbx_spec::DisksSpec {
+                root_mib: parse_opt_size("rootSize", self.sandbox_options.root_size.as_deref())?,
+                docker_mib: parse_opt_size(
+                    "dockerSize",
+                    self.sandbox_options.docker_size.as_deref(),
+                )?,
+                cloned_workspace_mib: parse_opt_size(
+                    "clonedWorkspaceSize",
+                    self.sandbox_options.cloned_workspace_size.as_deref(),
+                )?,
+            },
+        };
+
+        let capabilities = osbx_spec::CapabilitiesSpec {
+            nested: self.sandbox_options.nested,
+            gpu: self.sandbox_options.gpu,
+            display: self.sandbox_options.display,
+            fuse: self.sandbox_options.fuse,
+            usb: self.sandbox_options.usb.clone().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        let agent_options = osbx_spec::AgentOptionsSpec {
+            skills,
+            writable_env_files: self.sandbox_options.writable_env_files,
+        };
+
+        let mut ports = Vec::with_capacity(self.ports.len());
+        for p in &self.ports {
+            let target = u16::try_from(p.sandbox)
+                .map_err(|_| EnvError(format!("port.sandbox {} out of range", p.sandbox)))?;
+            let host = match p.host {
+                Some(h) => u16::try_from(h).map_err(|_| EnvError("port.host out of range".into()))?,
+                None => 0,
+            };
+            let protocol = match p.protocol.as_deref() {
+                None => osbx_spec::PortProtocol::Tcp4,
+                Some(s) => s.parse().map_err(|e: osbx_spec::SpecError| EnvError(e.0))?,
+            };
+            let host_ip = p
+                .host_ip
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("127.0.0.1")
+                .to_owned();
+            ports.push(osbx_spec::PortSpec {
+                host_ip,
+                host,
+                target,
+                protocol,
+            });
+        }
+
+        // Combine `secrets:` and `bindings:` by service name.
+        let mut secrets = BTreeMap::new();
+        for (name, s) in &self.secrets {
+            let value = s.to_spec(name)?;
+            secrets.insert(
+                name.clone(),
+                osbx_spec::SecretSpec {
+                    value: Some(value),
+                    required: true,
+                    bindings: osbx_spec::BindingSpec::default(),
+                    inject: None,
+                },
+            );
+        }
+        for (name, b) in &self.bindings {
+            let entry = secrets
+                .entry(name.clone())
+                .or_insert_with(|| osbx_spec::SecretSpec {
+                    value: None,
+                    required: true,
+                    bindings: osbx_spec::BindingSpec::default(),
+                    inject: None,
+                });
+            if let Some(a) = &b.api_key {
+                entry.bindings.api_key_domains = a.domains.clone();
+            }
+            if let Some(o) = &b.oauth {
+                entry.bindings.oauth_domains = o.domains.clone();
+            }
+        }
+
+        let mut registries = BTreeMap::new();
+        for (reg_name, r) in &self.registries {
+            let secret = r.secret.to_spec(reg_name)?;
+            let username = r
+                .username
+                .as_ref()
+                .map(|u| u.to_spec(reg_name))
+                .transpose()?;
+            registries.insert(
+                reg_name.clone(),
+                osbx_spec::RegistrySpec { username, secret },
+            );
+        }
+
+        let mut mcp = Vec::with_capacity(self.mcp.servers.len());
+        for s in &self.mcp.servers {
+            let transport = match (&s.url, &s.command) {
+                (Some(url), None) => osbx_spec::McpTransport::Remote { url: url.clone() },
+                (None, Some(command)) => osbx_spec::McpTransport::Stdio {
+                    command: command.clone(),
+                    args: s.args.clone(),
+                },
+                _ => {
+                    return bad(format!(
+                        "mcp server {:?}: exactly one of url/command",
+                        s.name
+                    ));
+                }
+            };
+            mcp.push(osbx_spec::McpServerSpec {
+                name: s.name.clone(),
+                transport,
+            });
+        }
+
+        let to_host_cmd = |c: &HostCommand| osbx_spec::HostCommandSpec {
+            name: c.name.clone(),
+            command: c.command.clone(),
+            workdir: c.workdir.clone(),
+            timeout: c.timeout.clone(),
+        };
+        let hooks = osbx_spec::HooksSpec {
+            initialize: self.lifecycle.initialize.iter().map(to_host_cmd).collect(),
+            post_create: self.lifecycle.post_create.iter().map(to_host_cmd).collect(),
+            pre_remove: self.lifecycle.pre_remove.iter().map(to_host_cmd).collect(),
+            ..Default::default()
+        };
+
+        let sandbox_key = self.name.clone().unwrap_or_else(|| "default".into());
+        let sandbox = osbx_spec::SandboxSpec {
+            name: self.name.clone(),
+            profiles: Vec::new(),
+            agent: self.agent.clone(),
+            // In sbxenv.yaml, `sandboxOptions.template` overrides the base image.
+            image: self.sandbox_options.template.clone(),
+            template: None,
+            pull_policy,
+            entrypoint: self.entrypoint.clone(),
+            command: self.cmd.clone(),
+            workdir: None,
+            workspace,
+            mounts,
+            env: self.env.clone(),
+            resources,
+            capabilities,
+            agent_options,
+            kits,
+            ports,
+            firewall: osbx_spec::FirewallSpec::default(),
+            secrets,
+            registries,
+            mcp,
+            hooks,
+        };
+
+        let project = osbx_spec::ProjectSpec {
+            name: self.name.clone(),
+            volumes: BTreeMap::new(),
+            sandboxes: BTreeMap::from([(sandbox_key, sandbox)]),
+        };
+        project.validate().map_err(|e| EnvError(e.0))?;
+        Ok(project)
+    }
 }
 
 #[cfg(test)]
@@ -851,5 +1127,111 @@ mod tests {
         ok(&format!(
             "{H}ports: [{{sandbox: 8080, host: 0, hostIP: ''}}]\nmcp: {{servers: [{{name: a, command: npx, args: [x]}}]}}\n"
         ));
+    }
+
+    #[test]
+    fn compiles_into_canonical_osbx_spec() {
+        let tpl = r#"schemaVersion: "1"
+name: osbx
+agent: claude
+workspace:
+  path: ./osbx
+  clone: true
+additionalWorkspaces:
+  - path: ./shared
+    target: /shared
+    readOnly: true
+kits:
+  - ./osbx/dev/kits/host-state
+  - source: sbx/gh:2.103.2
+    args:
+      protocol: https
+mounts:
+  /home/agent/claude-history: "${{ env.fileDir }}/sessions"
+env:
+  CARGO_INCREMENTAL: "0"
+sandboxOptions:
+  template: custom/claude:1
+  memory: 8g
+  cpus: 4
+  rootSize: 40g
+  dockerSize: 20g
+  clonedWorkspaceSize: 10g
+  pullPolicy: missing
+  skills: readonly
+  nested: true
+  gpu: true
+  display: true
+  fuse: true
+  usb: ["1234:5678"]
+  writableEnvFiles: false
+secrets:
+  github:
+    command: gh auth token
+bindings:
+  github:
+    apiKey:
+      domains: [api.github.com]
+registries:
+  ghcr.io:
+    secret:
+      command: gh auth token
+mcp:
+  servers:
+    - name: docs
+      url: https://docs.example/mcp
+ports:
+  - sandbox: 8080
+    host: 8080
+    hostIP: 127.0.0.1
+    protocol: tcp
+lifecycle:
+  initialize:
+    - name: prep
+      command: echo hi
+      timeout: 1m
+"#;
+        let p = compile(
+            &[tpl],
+            &Context {
+                project_dir: "/r".into(),
+                file_dir: "/r".into(),
+                args: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(p.name.as_deref(), Some("osbx"));
+        let sb = &p.sandboxes["osbx"];
+        assert_eq!(sb.agent, "claude");
+        assert_eq!(sb.image.as_deref(), Some("custom/claude:1"));
+        assert_eq!(sb.resources.cpus, Some(4));
+        assert_eq!(sb.resources.memory_mib, Some(8192));
+        assert_eq!(sb.resources.disks.root_mib, Some(40 * 1024));
+        assert_eq!(sb.resources.disks.docker_mib, Some(20 * 1024));
+        assert_eq!(sb.resources.disks.cloned_workspace_mib, Some(10 * 1024));
+        assert_eq!(sb.pull_policy, Some(osbx_spec::PullPolicy::Missing));
+        assert_eq!(sb.agent_options.skills, Some(osbx_spec::SkillsMode::Readonly));
+        assert_eq!(sb.capabilities.nested, Some(true));
+        assert_eq!(sb.capabilities.usb, ["1234:5678"]);
+        assert_eq!(
+            sb.workspace.as_ref().unwrap().mode,
+            osbx_spec::WorkspaceMode::Clone
+        );
+        assert_eq!(sb.mounts.len(), 2);
+        assert_eq!(sb.mounts[0].kind, osbx_spec::MountKind::Bind);
+        assert!(sb.mounts[0].read_only);
+        assert_eq!(sb.mounts[1].kind, osbx_spec::MountKind::KitMount);
+        assert_eq!(sb.mounts[1].source, "/r/sessions");
+        assert_eq!(sb.kits.len(), 2);
+        assert_eq!(sb.kits[1].args["protocol"], "https");
+        assert_eq!(
+            sb.secrets["github"].bindings.api_key_domains,
+            ["api.github.com"]
+        );
+        assert!(sb.registries.contains_key("ghcr.io"));
+        assert_eq!(sb.mcp.len(), 1);
+        assert_eq!(sb.ports.len(), 1);
+        assert_eq!(sb.ports[0].target, 8080);
+        assert_eq!(sb.hooks.initialize.len(), 1);
     }
 }

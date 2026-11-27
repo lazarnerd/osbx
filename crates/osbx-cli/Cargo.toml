@@ -12,12 +12,14 @@ path = "src/main.rs"
 
 [dependencies]
 osbx-policy.workspace = true
+osbx-spec.workspace = true
 osbx-secrets = { path = "../osbx-secrets" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 osbx-kit = { path = "../osbx-kit" }
 osbx-env = { path = "../osbx-env" }
+osbx-compose = { path = "../osbx-compose" }
 osbx-vmm = { path = "../osbx-vmm" }
 clap.workspace = true
 
