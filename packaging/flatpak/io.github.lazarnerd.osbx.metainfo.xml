@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>io.github.lazarnerd.osbx</id>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>osbx</name>
+  <summary>Open-source microVM sandbox runtime for coding agents</summary>
+  <description>
+    <p>
+      osbx runs coding agents inside lightweight KVM microVMs driven by its own VMM, with
+      deny-by-default egress through a host-side policy proxy that injects credentials the
+      sandbox never sees. Kit v3 descriptors add tools, network rules, credentials, persistent
+      storage, host mounts, SSH agent forwarding, lifecycle hooks, and nested KVM access.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/lazarnerd/osbx</url>
+  <url type="bugtracker">https://github.com/lazarnerd/osbx/issues</url>
+  <url type="vcs-browser">https://github.com/lazarnerd/osbx</url>
+  <developer id="io.github.lazarnerd">
+    <name>lazarnerd</name>
+  </developer>
+  <provides>
+    <binary>osbx</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>System</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+</component>

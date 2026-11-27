@@ -8,6 +8,9 @@ rustc-ice-*.txt
 # Guest kernel/initramfs/agent, built by guest/build-assets.sh
 /guest/assets/
 
+# Packaging outputs (self-hosted Flatpak repo and bundles)
+/dist/
+
 # Project skills, reproducible via dev/install-skills.sh (commit-pinned in dev/skills.conf)
 /.claude/skills
 

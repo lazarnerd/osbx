@@ -25,6 +25,32 @@ cd ~/my-project
 osbx run shell                                # create + start + attach (workspace = cwd)
 ```
 
+### Linux Flatpak (self-hosted bundle + easy upgrades)
+
+Build a standalone `.flatpak` bundle and local OSTree repository (`dist/flatpak/`), install it for
+your user, and add an `osbx` wrapper in `~/.local/bin/osbx`:
+
+```bash
+./scripts/build-flatpak.sh --install          # build + install (or upgrade in place)
+osbx vmm probe --run-guest                    # or: flatpak run io.github.lazarnerd.osbx ...
+```
+
+To **upgrade locally** after pulling new commits, re-run `./scripts/build-flatpak.sh --install`
+(exports a new commit to the local OSTree repo and runs `flatpak update --user`, preserving your
+sandboxes in `~/.var/app/io.github.lazarnerd.osbx/data/osbx`).
+
+To **upgrade via `flatpak update` on any machine**, enable GitHub Pages (Source: GitHub Actions)
+and trigger the `flatpak` workflow (or push a `v*` tag). It publishes a self-hosted OSTree repo at
+`https://lazarnerd.github.io/osbx/flatpak-repo` and attaches `osbx-<ver>-x86_64.flatpak` to the
+GitHub Release:
+
+```bash
+flatpak remote-add --user --if-not-exists --no-gpg-verify osbx https://lazarnerd.github.io/osbx/flatpak-repo
+flatpak install --user osbx io.github.lazarnerd.osbx
+# later:
+flatpak update --user io.github.lazarnerd.osbx
+```
+
 ### Windows
 
 Requirements: Windows 10 2004+ or 11 with the **Windows Hypervisor Platform** feature
@@ -94,7 +120,8 @@ selection), `osbx-secrets` (stores, sources, injection), `osbx-proxy` (egress pr
 | `crates/` | The Rust workspace (see above) |
 | `guest/` | Guest init and `build-assets.sh` (kernel, initramfs, agent into `guest/assets/`, not committed) |
 | `third_party/vm-memory/` | Patched `vm-memory` (see its `OSBX-PATCH.md`) |
-| `scripts/` | Runtime install scripts (`install-osbx.ps1`) |
+| `scripts/` | Install and packaging scripts (`install-osbx.ps1`, `build-flatpak.sh`) |
+| `packaging/` | Self-hosted Flatpak AppStream metainfo |
 | `docs/` | `ARCHITECTURE.md`, `STATUS.md`, `PLAN.md`, `PROVENANCE.md` |
 | `dev/` | Contributor dev environment (Docker `sbx` sandbox, skills); not part of the runtime |
 
