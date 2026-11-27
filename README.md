@@ -47,15 +47,35 @@ Hardware-isolated KVM &amp; WHP microVMs · Zero-NIC egress proxy · Blind crede
 
 ### Linux — Flatpak (recommended)
 
-Install from the self-hosted OSTree repository for single-command upgrades via `flatpak update`:
+Install from the self-hosted OSTree repository and set up the `osbx` CLI wrapper in `~/.local/bin/osbx` (so you can run `osbx` directly in the terminal instead of `flatpak run io.github.lazarnerd.osbx`):
 
 ```bash
-flatpak remote-add --user --if-not-exists --no-gpg-verify osbx https://lazarnerd.github.io/osbx/flatpak-repo
-flatpak install --user osbx io.github.lazarnerd.osbx
+curl -fsSL https://raw.githubusercontent.com/lazarnerd/osbx/main/scripts/install-flatpak.sh | sh
+
+osbx vmm probe --run-guest                   # verify host KVM (and nested kvm@1) support
+cd ~/my-project
+osbx run shell                               # create + start + attach (workspace = cwd)
 
 # Upgrade later:
 flatpak update --user io.github.lazarnerd.osbx
 ```
+
+> Pass `--system` to install system-wide (with `/usr/local/bin/osbx`), `--bin-dir DIR` to customize the wrapper location, a local `.flatpak` bundle path to install offline, or `--uninstall` to remove both the Flatpak and wrapper (e.g. `curl -fsSL ... | sh -s -- --uninstall`).
+
+<details>
+<summary><strong>Manual Flatpak install (without curl | sh)</strong></summary>
+
+Flatpak only exports binaries under their full application ID (`io.github.lazarnerd.osbx`), so link the exported wrapper into `~/.local/bin/osbx` after installing:
+
+```bash
+flatpak remote-add --user --if-not-exists --no-gpg-verify osbx https://lazarnerd.github.io/osbx/flatpak-repo
+flatpak install --user osbx io.github.lazarnerd.osbx
+mkdir -p ~/.local/bin && ln -sf "${XDG_DATA_HOME:-$HOME/.local/share}/flatpak/exports/bin/io.github.lazarnerd.osbx" ~/.local/bin/osbx
+```
+
+Make sure `~/.local/bin` is on your `PATH`, or re-run `./scripts/install-flatpak.sh --shim-only` to create and check the wrapper for you.
+
+</details>
 
 <details>
 <summary><strong>Build &amp; upgrade a local Flatpak bundle (or publish via GitHub Pages)</strong></summary>
@@ -193,7 +213,7 @@ Sandbox state lives in `$OSBX_HOME` (default `~/.local/share/osbx` on Linux, `%L
 | `crates/` | Rust workspace (see above) |
 | `guest/` | Guest init and `build-assets.sh` (builds kernel, initramfs, and agent into git-ignored `guest/assets/`) |
 | `third_party/vm-memory/` | Patched `vm-memory` (see [`OSBX-PATCH.md`](third_party/vm-memory/OSBX-PATCH.md)) |
-| `scripts/` | Install and packaging scripts (`install-osbx.ps1`, `build-flatpak.sh`) |
+| `scripts/` | Install and packaging scripts (`install-flatpak.sh`, `install-osbx.ps1`, `build-flatpak.sh`) |
 | `packaging/` | Self-hosted Flatpak AppStream metainfo |
 | `assets/` | Project vector logo and icon marks (`logo-dark.svg`, `logo-light.svg`, `icon.svg`) |
 | `docs/` | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`STATUS.md`](docs/STATUS.md), [`PLAN.md`](docs/PLAN.md), [`PROVENANCE.md`](docs/PROVENANCE.md) |

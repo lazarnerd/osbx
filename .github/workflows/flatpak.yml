@@ -43,6 +43,7 @@ jobs:
           mkdir -p site/flatpak-repo
           cp -a dist/flatpak/repo/. site/flatpak-repo/
           cp -f dist/flatpak/osbx.flatpakrepo site/flatpak-repo/osbx.flatpakrepo
+          cp -f scripts/install-flatpak.sh site/install.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -50,6 +51,7 @@ jobs:
           path: |
             dist/flatpak/osbx-*.flatpak
             dist/flatpak/osbx.flatpakrepo
+            scripts/install-flatpak.sh
 
       - uses: actions/upload-pages-artifact@v3
         with:
@@ -62,6 +64,7 @@ jobs:
           files: |
             dist/flatpak/osbx-*.flatpak
             dist/flatpak/osbx.flatpakrepo
+            scripts/install-flatpak.sh
 
   deploy-pages:
     needs: build
