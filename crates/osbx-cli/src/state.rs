@@ -178,11 +178,25 @@ pub struct Launch {
     pub workdir: String,
 }
 
+/// Guest operating system running inside a sandbox microVM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuestOs {
+    /// Linux direct-boot microVM (default).
+    #[default]
+    Linux,
+    /// Windows UEFI (Q35 PCIe + OVMF) VM.
+    Windows,
+}
+
 /// A sandbox definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// Name.
     pub name: String,
+    /// Guest OS (`linux` by default; `windows` for UEFI Windows sandboxes).
+    #[serde(default)]
+    pub guest_os: GuestOs,
     /// Agent name or image reference it was created from.
     pub agent: String,
     /// Image reference the root filesystem was built from.
@@ -221,6 +235,9 @@ pub struct Record {
     /// Optional per-sandbox egress firewall (preset override + allow/deny/HTTP rules).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firewall: Option<osbx_spec::FirewallSpec>,
+    /// Attach an emulated CRB vTPM 2.0 device (`0xFED4_0000`, Windows UEFI guests).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vtpm: bool,
     /// Unix seconds.
     pub created: u64,
 }

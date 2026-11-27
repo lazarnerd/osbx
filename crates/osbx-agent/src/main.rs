@@ -4,15 +4,23 @@
 //! * proxy egress: a TCP listener on 127.0.0.1:3128 whose connections are piped to the host,
 //!   where the policy proxy serves them.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+mod windows;
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
-    eprintln!("osbx-agent only runs inside a Linux guest");
+    eprintln!("osbx-agent only runs inside a Linux or Windows guest");
     std::process::exit(1);
 }
 
 #[cfg(target_os = "linux")]
 fn main() {
     linux::run();
+}
+
+#[cfg(windows)]
+fn main() {
+    windows::run();
 }
 
 #[cfg(target_os = "linux")]

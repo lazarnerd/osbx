@@ -4,9 +4,7 @@
 //! the virtio glue. Files the guest creates are owned by the user running the VMM on the host,
 //! which is what a shared workspace wants.
 
-use super::{
-    Activation, GuestMem, INT_USED_RING, Interrupt, SharedQueue, VIRTIO_F_VERSION_1, VirtioDevice,
-};
+use super::{Activation, GuestMem, Interrupt, SharedQueue, VIRTIO_F_VERSION_1, VirtioDevice};
 use fuse_backend_rs::abi::fuse_abi::{
     CreateIn, FsOptions, OpenOptions, SetattrValid, stat64, statvfs64,
 };
@@ -473,10 +471,10 @@ impl VirtioDevice for Fs {
         let Some((mem, queues, irq)) = self.active.clone() else {
             return;
         };
-        let Some(queue) = queues.get(queue as usize) else {
+        let Some(q_arc) = queues.get(queue as usize) else {
             return;
         };
-        let mut q = queue.lock().unwrap();
+        let mut q = q_arc.lock().unwrap();
         let mut signal = false;
         while let Ok(iter) = q.iter(&mem) {
             let chains: Vec<_> = iter.collect();
@@ -505,7 +503,7 @@ impl VirtioDevice for Fs {
         }
         if signal && q.needs_notification(&mem).unwrap_or(true) {
             drop(q);
-            irq.signal(INT_USED_RING);
+            irq.signal_queue(queue as u16);
         }
     }
 }

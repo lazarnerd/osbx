@@ -31,11 +31,15 @@ impl std::fmt::Display for GuestError {
 impl std::error::Error for GuestError {}
 
 #[cfg(any(target_os = "linux", windows))]
+pub mod acpi;
+#[cfg(any(target_os = "linux", windows))]
 mod boot;
 #[cfg(any(target_os = "linux", windows))]
 mod bus;
 #[cfg(any(target_os = "linux", windows))]
 mod devices;
+#[cfg(any(target_os = "linux", windows))]
+pub mod hpet;
 #[cfg(any(target_os = "linux", windows))]
 pub mod ioapic;
 #[cfg(any(target_os = "linux", windows))]
@@ -43,12 +47,24 @@ pub mod irq;
 #[cfg(any(target_os = "linux", windows))]
 mod mptable;
 #[cfg(any(target_os = "linux", windows))]
+pub mod pci;
+#[cfg(any(target_os = "linux", windows))]
+pub mod pflash;
+#[cfg(any(target_os = "linux", windows))]
+pub mod qcow2;
+#[cfg(any(target_os = "linux", windows))]
+pub mod tpm;
+#[cfg(any(target_os = "linux", windows))]
+mod uefi;
+#[cfg(any(target_os = "linux", windows))]
 pub mod virtio;
 #[cfg(any(target_os = "linux", windows))]
 pub use boot::{
     BootConfig, BootError, BootOutcome, DEFAULT_CMDLINE, DiskConfig, ExitReason, ShareConfig, Vm,
     boot_linux,
 };
+#[cfg(any(target_os = "linux", windows))]
+pub use uefi::{UefiConfig, UefiOutcome, UefiVm, boot_uefi};
 
 #[cfg(target_os = "linux")]
 mod guest;

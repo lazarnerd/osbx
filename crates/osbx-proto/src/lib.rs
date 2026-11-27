@@ -22,8 +22,10 @@ pub const TUNNEL_PORT: u32 = 1025;
 pub const SSH_AGENT_PORT: u32 = 1026;
 /// Host vsock port the guest's egress is delivered to.
 pub const EGRESS_PORT: u32 = 3128;
-/// Where processes inside the guest find the forwarded SSH agent socket (`ssh-agent@1`).
+/// Where processes inside a Linux guest find the forwarded SSH agent socket (`ssh-agent@1`).
 pub const GUEST_SSH_AUTH_SOCK: &str = "/run/osbx/ssh-agent.sock";
+/// Where processes inside a Windows guest find the forwarded SSH agent named pipe (`ssh-agent@1`).
+pub const GUEST_WINDOWS_SSH_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 /// Where processes inside the guest find the proxy.
 pub const GUEST_PROXY_ADDR: &str = "127.0.0.1:3128";
 /// Where the agent listens for egress: every guest interface. The guest has no NIC, so this only
@@ -78,6 +80,9 @@ pub struct ExecRequest {
     /// Initial terminal size when `tty` is set.
     #[serde(default)]
     pub cols: u16,
+    /// Launch in the interactive desktop session (`winsta0\default`, Windows guests only).
+    #[serde(default)]
+    pub gui: bool,
 }
 
 /// Encode a [`RESIZE`] payload.

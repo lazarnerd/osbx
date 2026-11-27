@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use vm_memory::{GuestMemory, GuestMemoryRegion};
 use windows_sys::Win32::System::Hypervisor::*;
 
-fn check(what: &str, hr: i32) -> Result<(), BootError> {
+pub(crate) fn check(what: &str, hr: i32) -> Result<(), BootError> {
     if hr < 0 {
         Err(BootError(format!("{what}: HRESULT 0x{:08x}", hr as u32)))
     } else {
@@ -100,10 +100,10 @@ impl Drop for PartitionSlot {
 
 /// A partition handle (Send/Sync: WHP calls on one partition are thread-safe).
 #[derive(Clone, Copy)]
-struct Partition(WHV_PARTITION_HANDLE);
+pub(crate) struct Partition(pub(crate) WHV_PARTITION_HANDLE);
 
 impl Partition {
-    fn set_property<T>(&self, code: WHV_PARTITION_PROPERTY_CODE, value: &T) -> i32 {
+    pub(crate) fn set_property<T>(&self, code: WHV_PARTITION_PROPERTY_CODE, value: &T) -> i32 {
         // SAFETY: `value` points at a properly sized, initialized property value of type T.
         unsafe {
             WHvSetPartitionProperty(
@@ -115,7 +115,7 @@ impl Partition {
         }
     }
 
-    fn set_registers(
+    pub(crate) fn set_registers(
         &self,
         vp: u32,
         names: &[WHV_REGISTER_NAME],
@@ -135,7 +135,7 @@ impl Partition {
         check("WHvSetVirtualProcessorRegisters", hr)
     }
 
-    fn deliver(&self, m: Message) {
+    pub(crate) fn deliver(&self, m: Message) {
         let mut ctl: WHV_INTERRUPT_CONTROL = WHV_INTERRUPT_CONTROL {
             _bitfield: 0,
             Destination: u32::from(m.dest),
