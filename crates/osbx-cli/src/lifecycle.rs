@@ -2,8 +2,8 @@
 
 use crate::client::{self, Attach};
 use crate::state::{
-    Launch, Record, StoredPolicy, StoredRule, Workspace, WorkspaceMode, assets_dir, check_name,
-    home, sandbox_dir,
+    GuestOs, Launch, Record, StoredPolicy, StoredRule, Workspace, WorkspaceMode, assets_dir,
+    check_name, home, sandbox_dir,
 };
 use crate::supervisor;
 use osbx_proto::ExecRequest;
@@ -226,6 +226,8 @@ pub struct CreateOpts {
     pub template: Option<String>,
     /// Root disk size in MiB.
     pub root_size_mib: Option<u64>,
+    /// Explicit guest OS override (None infers from template or defaults to Linux).
+    pub guest_os: Option<GuestOs>,
     /// Host directories for kit host-mount paths (sandbox path -> host dir).
     pub mounts: BTreeMap<String, PathBuf>,
 }
@@ -359,7 +361,7 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
         .filter(|k| k.kind == "mixin")
         .filter_map(|k| k.image.clone())
         .collect();
-    let (image, base, launch) = match &o.template {
+    let (image, base, launch, guest_os, template_vars, is_qcow2_tpl) = match &o.template {
         Some(t) => {
             let meta: Value = serde_json::from_slice(
                 &std::fs::read(template_dir().join(format!("{t}.json")))
@@ -371,28 +373,71 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
                     "--template cannot be combined with kits that add content",
                 ));
             }
+            let tpl_os = match meta["guest_os"].as_str() {
+                Some("windows") => GuestOs::Windows,
+                _ => GuestOs::Linux,
+            };
+            let guest_os = o.guest_os.unwrap_or(tpl_os);
+            let is_qcow2 = meta["disk_format"].as_str() == Some("qcow2")
+                || template_dir().join(format!("{t}.qcow2")).exists();
+            let disk = if is_qcow2 {
+                template_dir().join(format!("{t}.qcow2"))
+            } else {
+                template_dir().join(format!("{t}.img"))
+            };
+            let vars = template_dir().join(format!("{t}.vars.fd"));
             let launch: Launch =
                 serde_json::from_value(meta["launch"].clone()).map_err(io::Error::other)?;
             (
                 meta["image"].as_str().unwrap_or(&image).to_owned(),
-                template_dir().join(format!("{t}.img")),
+                disk,
                 launch,
+                guest_os,
+                vars.exists().then_some(vars),
+                is_qcow2,
             )
         }
         None => {
+            if o.guest_os == Some(GuestOs::Windows) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows sandboxes require --template <name> (build one with `osbx windows build-base`)",
+                ));
+            }
             let base = base_rootfs(&image, &overlays)?;
             let launch = crate::images::launch_of(&image)?;
-            (image, base, launch)
+            (image, base, launch, GuestOs::Linux, None, false)
         }
     };
     let dir = sandbox_dir(&name);
     std::fs::create_dir_all(&dir)?;
-    osbx_vmm::disk::copy_sparse(&base, &dir.join("root.img")).map_err(|e| {
-        io::Error::new(e.kind(), format!("copying the root filesystem failed: {e}"))
-    })?;
-    if let Some(mib) = o.root_size_mib {
-        grow_disk(&dir.join("root.img"), mib)?;
+    if is_qcow2_tpl {
+        // Instant CoW QCOW2 overlay pointing at the immutable template disk.
+        osbx_vmm::qcow2::create_overlay(&dir.join("root.qcow2"), &base).map_err(|e| {
+            io::Error::new(e.kind(), format!("creating CoW disk overlay failed: {e}"))
+        })?;
+    } else {
+        osbx_vmm::disk::copy_sparse(&base, &dir.join("root.img")).map_err(|e| {
+            io::Error::new(e.kind(), format!("copying the root filesystem failed: {e}"))
+        })?;
+        if let Some(mib) = o.root_size_mib {
+            grow_disk(&dir.join("root.img"), mib)?;
+        }
     }
+    if guest_os == GuestOs::Windows {
+        let vars_dst = dir.join("ovmf_vars.fd");
+        if let Some(vars_src) = template_vars {
+            std::fs::copy(&vars_src, &vars_dst)?;
+        } else {
+            let (_, default_vars) = crate::windows::find_ovmf(None, None)?;
+            std::fs::copy(&default_vars, &vars_dst)?;
+        }
+    }
+    let mem_mib = if guest_os == GuestOs::Windows && mem_mib < 4096 {
+        4096
+    } else {
+        mem_mib
+    };
     if o.clone
         && let Some(repo) = &ws
     {
@@ -413,6 +458,7 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
         .collect::<io::Result<_>>()?;
     Record {
         name: name.clone(),
+        guest_os,
         agent: o.agent.clone(),
         image,
         workspace: ws.map(|host| Workspace {
@@ -1070,6 +1116,7 @@ pub fn env_run(file: &Path, env_args: &[String], detach: bool) -> io::Result<i32
         kvm: false,
         docker: false,
         template: None,
+        guest_os: None,
         root_size_mib: e
             .sandbox_options
             .root_size
@@ -1178,6 +1225,7 @@ mod tests {
     fn agent_request_prefers_workspace_and_image_user() {
         let rec = Record {
             name: "n".into(),
+            guest_os: GuestOs::Linux,
             agent: "shell".into(),
             image: "i".into(),
             workspace: Some(Workspace {

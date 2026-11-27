@@ -4,7 +4,9 @@
 //! Requests are one JSON line, `{"op": ...}`. `exec` is followed by the agent protocol: the
 //! supervisor fills in the sandbox's environment, then splices the client to the guest agent.
 
-use crate::state::{Record, StoredPolicy, WorkspaceMode, assets_dir, control_socket, sandbox_dir};
+use crate::state::{
+    GuestOs, Record, StoredPolicy, WorkspaceMode, assets_dir, control_socket, sandbox_dir,
+};
 use crate::sys::{LocalListener as UnixListener, LocalStream as UnixStream};
 use osbx_policy::PolicySet;
 use osbx_proto::{EXEC, ExecRequest, read_frame, write_frame};
@@ -216,15 +218,17 @@ pub fn supervise(name: &str) -> io::Result<()> {
     let dir = sandbox_dir(name);
     let assets = assets_dir();
     let (kernel, initrd) = (assets.join("vmlinuz"), assets.join("initramfs.cpio.gz"));
-    for p in [&kernel, &initrd] {
-        if !p.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "{} missing (build guest assets and set OSBX_ASSETS)",
-                    p.display()
-                ),
-            ));
+    if rec.guest_os == GuestOs::Linux {
+        for p in [&kernel, &initrd] {
+            if !p.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{} missing (build guest assets and set OSBX_ASSETS)",
+                        p.display()
+                    ),
+                ));
+            }
         }
     }
     let ca_pem = std::fs::read_to_string(dir.join("ca.pem"))?;
@@ -398,42 +402,89 @@ pub fn supervise(name: &str) -> io::Result<()> {
         env.entry("SSH_AUTH_SOCK".into())
             .or_insert_with(|| osbx_proto::GUEST_SSH_AUTH_SOCK.into());
     }
-    // a larger disk size in the record (CLI --disk or sbxenv rootSize) is applied before boot
-    if let Some(mib) = rec.root_size_mib {
-        crate::lifecycle::grow_disk(&dir.join("root.img"), mib)?;
-    }
-    let sb = Sandbox::start(SandboxConfig {
-        name: name.to_owned(),
-        kernel,
-        initrd,
-        disks: vec![osbx_vmm_disk(dir.join("root.img"))],
-        extra_cmdline: format!(
-            "root=/dev/vda{}{}",
-            if crate::kits::wants_kvm(&rec.kits) {
-                " osbx.kvm=1"
-            } else {
-                ""
-            },
-            if wants_docker(&rec) {
-                " osbx.docker=1"
-            } else {
-                ""
+    let sb = match rec.guest_os {
+        GuestOs::Linux => {
+            // a larger disk size in the record (CLI --disk or sbxenv rootSize) is applied before boot
+            if let Some(mib) = rec.root_size_mib {
+                crate::lifecycle::grow_disk(&dir.join("root.img"), mib)?;
             }
-        ),
-        shares,
-        mem_mib: rec.mem_mib,
-        cpus: rec.cpus,
-        policy: policy.clone(),
-        credentials,
-        ca: Arc::new(ca),
-        env,
-        upstream: None,
-        client_tls: None,
-        events: Some(ev_tx),
-        ssh_agent,
-    })?;
-    sb.wait_ready(Duration::from_secs(120))?;
-    first_boot_setup(&sb, &rec, &ca_pem);
+            Sandbox::start(SandboxConfig {
+                name: name.to_owned(),
+                kernel,
+                initrd,
+                disks: vec![osbx_vmm_disk(dir.join("root.img"))],
+                extra_cmdline: format!(
+                    "root=/dev/vda{}{}",
+                    if crate::kits::wants_kvm(&rec.kits) {
+                        " osbx.kvm=1"
+                    } else {
+                        ""
+                    },
+                    if wants_docker(&rec) {
+                        " osbx.docker=1"
+                    } else {
+                        ""
+                    }
+                ),
+                shares,
+                mem_mib: rec.mem_mib,
+                cpus: rec.cpus,
+                policy: policy.clone(),
+                credentials,
+                ca: Arc::new(ca),
+                env,
+                upstream: None,
+                client_tls: None,
+                events: Some(ev_tx),
+                ssh_agent,
+            })?
+        }
+        GuestOs::Windows => {
+            #[cfg(target_os = "linux")]
+            {
+                let (fw_code, _) = crate::windows::find_ovmf(None, None)?;
+                let fw_vars = dir.join("ovmf_vars.fd");
+                let root_disk = if dir.join("root.qcow2").exists() {
+                    dir.join("root.qcow2")
+                } else {
+                    dir.join("root.img")
+                };
+                Sandbox::start_uefi(osbx_sandbox::UefiSandboxConfig {
+                    name: name.to_owned(),
+                    firmware_code: fw_code,
+                    firmware_vars: fw_vars,
+                    disks: vec![osbx_vmm_disk(root_disk)],
+                    cdroms: vec![],
+                    mem_mib: rec.mem_mib,
+                    cpus: rec.cpus,
+                    policy: policy.clone(),
+                    credentials,
+                    ca: Arc::new(ca),
+                    env,
+                    upstream: None,
+                    client_tls: None,
+                    events: Some(ev_tx),
+                })?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Windows-guest sandboxes currently require a Linux/KVM host (WHP UEFI support is Phase W2)",
+                ));
+            }
+        }
+    };
+    sb.wait_ready(Duration::from_secs(if rec.guest_os == GuestOs::Windows {
+        300
+    } else {
+        120
+    }))?;
+    if rec.guest_os == GuestOs::Windows {
+        first_boot_setup_windows(&sb, &ca_pem);
+    } else {
+        first_boot_setup(&sb, &rec, &ca_pem);
+    }
     if let Err(e) = run_kit_lifecycle(&sb, &rec, &policy, &dir) {
         let _ = sb.shutdown(Duration::from_secs(10));
         return Err(e);
@@ -532,6 +583,24 @@ usermod -aG kvm "$name" 2>/dev/null || adduser "$name" kvm >/dev/null 2>&1 || \
             String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => eprintln!("kvm@1: setting up /dev/kvm access failed: {e}"),
+    }
+}
+
+/// Windows guest first-boot setup: push the per-sandbox CA PEM and invoke `osbx-agent.exe
+/// --install-ca` to trust it in `LocalMachine\Root` and configure WinHTTP/WinINET/env proxy.
+fn first_boot_setup_windows(sb: &Sandbox, ca_pem: &str) {
+    let ps = r#"New-Item -ItemType Directory -Force -Path 'C:\ProgramData\osbx' | Out-Null; [Console]::In.ReadToEnd() | Set-Content -NoNewline -Encoding Ascii 'C:\ProgramData\osbx\ca.pem'; & 'C:\Program Files\osbx\osbx-agent.exe' --install-ca 'C:\ProgramData\osbx\ca.pem'"#;
+    match sb.exec(
+        &["powershell.exe", "-NoProfile", "-Command", ps],
+        Some(ca_pem.as_bytes().to_vec()),
+    ) {
+        Ok(o) if o.code == 0 => {}
+        Ok(o) => eprintln!(
+            "windows first-boot CA setup failed ({}): {}",
+            o.code,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("windows first-boot CA setup failed: {e}"),
     }
 }
 

@@ -22,6 +22,8 @@ use osbx_proxy::{
 };
 use osbx_vmm::virtio::vsock::{VsockHost, VsockStream};
 use osbx_vmm::{BootConfig, DEFAULT_CMDLINE, ExitReason, Vm};
+#[cfg(target_os = "linux")]
+use osbx_vmm::{UefiConfig, UefiVm};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -106,10 +108,87 @@ impl ExecOutput {
     }
 }
 
+/// Configuration for starting a UEFI (Q35 PCIe / OVMF) sandbox (e.g., Windows guests).
+#[cfg(target_os = "linux")]
+pub struct UefiSandboxConfig {
+    /// Sandbox name (scopes sandbox-specific policy rules and secrets).
+    pub name: String,
+    /// Read-only UEFI code firmware (`OVMF_CODE_4M.fd`).
+    pub firmware_code: PathBuf,
+    /// Writable per-sandbox UEFI NVRAM (`OVMF_VARS_4M.fd`).
+    pub firmware_vars: PathBuf,
+    /// Disks attached over `virtio-blk` PCIe (raw or QCOW2 CoW overlay).
+    pub disks: Vec<DiskConfig>,
+    /// Optional read-only ISO CD-ROMs attached over `virtio-scsi` PCIe.
+    pub cdroms: Vec<PathBuf>,
+    /// Guest RAM in MiB.
+    pub mem_mib: usize,
+    /// Number of vCPUs.
+    pub cpus: u8,
+    /// Live network policy.
+    pub policy: Arc<RwLock<PolicySet>>,
+    /// Credentials the proxy may inject.
+    pub credentials: Arc<dyn Credentials>,
+    /// CA for TLS interception.
+    pub ca: Arc<Ca>,
+    /// Environment given to every command (proxy variables are added automatically).
+    pub env: BTreeMap<String, String>,
+    /// Override upstream connector (tests).
+    pub upstream: Option<Arc<dyn Upstream>>,
+    /// Override upstream TLS client config (tests).
+    pub client_tls: Option<Arc<rustls_reexport::ClientConfig>>,
+    /// Receive every policy decision.
+    pub events: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+}
+
+enum VmHandle {
+    Linux(Vm),
+    #[cfg(target_os = "linux")]
+    Uefi(UefiVm),
+}
+
+impl VmHandle {
+    fn vsock(&self) -> Option<&VsockHost> {
+        match self {
+            Self::Linux(v) => v.vsock(),
+            #[cfg(target_os = "linux")]
+            Self::Uefi(v) => v.vsock(),
+        }
+    }
+    fn console(&self) -> String {
+        match self {
+            Self::Linux(v) => v.console(),
+            #[cfg(target_os = "linux")]
+            Self::Uefi(v) => v.console(),
+        }
+    }
+    fn finished(&self) -> bool {
+        match self {
+            Self::Linux(v) => v.finished(),
+            #[cfg(target_os = "linux")]
+            Self::Uefi(v) => v.finished(),
+        }
+    }
+    fn wait(&self, timeout: Option<Duration>) -> Option<Result<ExitReason, osbx_vmm::BootError>> {
+        match self {
+            Self::Linux(v) => v.wait(timeout),
+            #[cfg(target_os = "linux")]
+            Self::Uefi(v) => v.wait(timeout),
+        }
+    }
+    fn stop(&self) -> ExitReason {
+        match self {
+            Self::Linux(v) => v.stop(),
+            #[cfg(target_os = "linux")]
+            Self::Uefi(v) => v.stop(),
+        }
+    }
+}
+
 /// A running sandbox.
 pub struct Sandbox {
     name: String,
-    vm: Vm,
+    vm: VmHandle,
     env: BTreeMap<String, String>,
     closed: Arc<AtomicBool>,
     _rt: Arc<tokio::runtime::Runtime>,
@@ -217,7 +296,68 @@ impl Sandbox {
             .or_insert_with(|| "localhost,127.0.0.1".into());
         Ok(Sandbox {
             name: cfg.name,
-            vm,
+            vm: VmHandle::Linux(vm),
+            env,
+            closed: Arc::new(AtomicBool::new(false)),
+            _rt: rt,
+        })
+    }
+
+    /// Boot a Q35 PCIe UEFI guest (e.g. Windows) and serve its egress through the host proxy.
+    #[cfg(target_os = "linux")]
+    pub fn start_uefi(cfg: UefiSandboxConfig) -> io::Result<Sandbox> {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?,
+        );
+        let upstream: Arc<dyn Upstream> = cfg.upstream.clone().unwrap_or_else(|| {
+            Arc::new(DirectUpstream {
+                policy: cfg.policy.clone(),
+                sandbox: cfg.name.clone(),
+                timeout: Duration::from_secs(30),
+            })
+        });
+        let proxy = Arc::new(ProxyConfig {
+            sandbox: cfg.name.clone(),
+            policy: cfg.policy.clone(),
+            credentials: cfg.credentials.clone(),
+            upstream,
+            ca: cfg.ca.clone(),
+            client_tls: cfg.client_tls.clone().unwrap_or_else(web_pki_client_config),
+            approve: None,
+            events: cfg.events.clone(),
+        });
+
+        let mut uefi = UefiConfig::new(cfg.firmware_code);
+        uefi.vars = Some(cfg.firmware_vars);
+        uefi.mem_mib = cfg.mem_mib;
+        uefi.cpus = cfg.cpus;
+        uefi.disks = cfg.disks;
+        uefi.cdroms = cfg.cdroms;
+        uefi.vsock_cid = Some(GUEST_CID);
+        uefi.hyperv = true;
+        let vm = UefiVm::start(&uefi).map_err(|e| io::Error::other(e.to_string()))?;
+
+        let accepted = vm.vsock().expect("vsock configured").listen(EGRESS_PORT);
+        let handle = rt.handle().clone();
+        std::thread::spawn(move || {
+            while let Ok(stream) = accepted.recv() {
+                bridge_to_proxy(&handle, stream, proxy.clone());
+            }
+        });
+
+        let mut env = cfg.env;
+        let proxy_url = format!("http://{GUEST_PROXY_ADDR}");
+        for k in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+            env.entry(k.into()).or_insert_with(|| proxy_url.clone());
+        }
+        env.entry("NO_PROXY".into())
+            .or_insert_with(|| "localhost,127.0.0.1".into());
+        Ok(Sandbox {
+            name: cfg.name,
+            vm: VmHandle::Uefi(vm),
             env,
             closed: Arc::new(AtomicBool::new(false)),
             _rt: rt,

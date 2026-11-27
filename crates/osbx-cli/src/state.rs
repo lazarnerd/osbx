@@ -156,11 +156,25 @@ pub struct Launch {
     pub workdir: String,
 }
 
+/// Guest operating system running inside a sandbox microVM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuestOs {
+    /// Linux direct-boot microVM (default).
+    #[default]
+    Linux,
+    /// Windows UEFI (Q35 PCIe + OVMF) VM.
+    Windows,
+}
+
 /// A sandbox definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// Name.
     pub name: String,
+    /// Guest OS (`linux` by default; `windows` for UEFI Windows sandboxes).
+    #[serde(default)]
+    pub guest_os: GuestOs,
     /// Agent name or image reference it was created from.
     pub agent: String,
     /// Image reference the root filesystem was built from.

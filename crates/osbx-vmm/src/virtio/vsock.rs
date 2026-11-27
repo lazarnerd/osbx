@@ -8,9 +8,7 @@
 //! Flow control follows the virtio spec: each side advertises `buf_alloc` and `fwd_cnt`, and a
 //! sender never has more than `buf_alloc` unconsumed bytes in flight.
 
-use super::{
-    Activation, GuestMem, INT_USED_RING, Interrupt, SharedQueue, VIRTIO_F_VERSION_1, VirtioDevice,
-};
+use super::{Activation, GuestMem, Interrupt, SharedQueue, VIRTIO_F_VERSION_1, VirtioDevice};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -488,7 +486,7 @@ fn pump(g: &mut Inner) {
         }
     }
     if used_any {
-        irq.signal(INT_USED_RING);
+        irq.signal_queue(0);
     }
 }
 
@@ -645,7 +643,7 @@ impl VsockDevice {
             let _ = listener.send(VsockStream::new(self.shared.clone(), key));
         }
         if signal {
-            irq.signal(INT_USED_RING);
+            irq.signal_queue(1);
         }
     }
 }

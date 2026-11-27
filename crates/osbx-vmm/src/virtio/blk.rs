@@ -1,10 +1,10 @@
-//! virtio-block: a raw image file exposed as a disk.
+//! virtio-block: a raw or QCOW2 image exposed as a disk.
 
 use super::{
     Activation, GuestMem, INT_USED_RING, Interrupt, SharedQueue, VIRTIO_F_VERSION_1, VirtioDevice,
 };
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use virtio_queue::{QueueOwnedT, QueueT};
 
@@ -16,33 +16,91 @@ const T_GET_ID: u32 = 8;
 const S_OK: u8 = 0;
 const S_IOERR: u8 = 1;
 const S_UNSUPP: u8 = 2;
+const F_SEG_MAX: u64 = 1 << 2;
+const F_BLK_SIZE: u64 = 1 << 6;
 const F_RO: u64 = 1 << 5;
 const F_FLUSH: u64 = 1 << 9;
 /// Device id string reported to the guest (visible as /sys/block/vdX/serial).
 const ID: &[u8; 20] = b"osbx-disk\0\0\0\0\0\0\0\0\0\0\0";
 
-/// A virtio-blk device backed by a file.
-pub struct Block {
+/// A random-access block storage backend (raw file, QCOW2 overlay, etc.).
+pub trait BlockBackend: Send + Sync {
+    /// Virtual disk size in bytes.
+    fn len(&self) -> u64;
+    /// Returns true if the disk has zero length.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Read `buf.len()` bytes starting at `offset`.
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+    /// Write all of `buf` starting at `offset`.
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    /// Flush dirty writes to durable storage.
+    fn flush(&self) -> io::Result<()>;
+}
+
+/// Flat raw file block backend.
+pub struct RawDisk {
     file: File,
+    len: u64,
+}
+
+impl RawDisk {
+    /// Open `path` as a flat raw disk image.
+    pub fn open(path: &Path, read_only: bool) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(!read_only)
+            .open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self { file, len })
+    }
+}
+
+impl BlockBackend for RawDisk {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        read_exact_at(&self.file, buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        write_all_at(&self.file, buf, offset)
+    }
+    fn flush(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+}
+
+/// A virtio-blk device backed by a [`BlockBackend`].
+pub struct Block {
+    backend: Box<dyn BlockBackend>,
     sectors: u64,
     read_only: bool,
     active: Option<(GuestMem, SharedQueue, Interrupt)>,
 }
 
 impl Block {
-    /// Open `path`; the guest sees `floor(size / 512)` sectors.
-    pub fn open(path: &Path, read_only: bool) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(!read_only)
-            .open(path)?;
-        let sectors = file.metadata()?.len() / SECTOR;
-        Ok(Self {
-            file,
+    /// Open `path` (auto-detecting QCOW2 v3 vs. flat raw image); the guest sees `floor(size / 512)`
+    /// sectors.
+    pub fn open(path: &Path, read_only: bool) -> io::Result<Self> {
+        let backend: Box<dyn BlockBackend> = if crate::qcow2::is_qcow2(path)? {
+            Box::new(crate::qcow2::Qcow2Disk::open(path, read_only)?)
+        } else {
+            Box::new(RawDisk::open(path, read_only)?)
+        };
+        Ok(Self::from_backend(backend, read_only))
+    }
+
+    /// Construct from an already-opened [`BlockBackend`].
+    pub fn from_backend(backend: Box<dyn BlockBackend>, read_only: bool) -> Self {
+        let sectors = backend.len() / SECTOR;
+        Self {
+            backend,
             sectors,
             read_only,
             active: None,
-        })
+        }
     }
 }
 
@@ -51,13 +109,22 @@ impl VirtioDevice for Block {
         2
     }
     fn features(&self) -> u64 {
-        VIRTIO_F_VERSION_1 | F_FLUSH | if self.read_only { F_RO } else { 0 }
+        VIRTIO_F_VERSION_1
+            | F_SEG_MAX
+            | F_BLK_SIZE
+            | F_FLUSH
+            | if self.read_only { F_RO } else { 0 }
     }
     fn queue_max_sizes(&self) -> Vec<u16> {
         vec![256]
     }
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let cfg = self.sectors.to_le_bytes(); // only `capacity` is advertised
+        // virtio_blk_config: capacity (0..8), size_max (8..12), seg_max (12..16),
+        // geometry (16..20), blk_size (20..24).
+        let mut cfg = [0u8; 24];
+        cfg[0..8].copy_from_slice(&self.sectors.to_le_bytes());
+        cfg[12..16].copy_from_slice(&126u32.to_le_bytes());
+        cfg[20..24].copy_from_slice(&(SECTOR as u32).to_le_bytes());
         for (i, b) in data.iter_mut().enumerate() {
             *b = cfg.get(offset as usize + i).copied().unwrap_or(0);
         }
@@ -120,7 +187,10 @@ impl Block {
                     status = S_IOERR;
                 } else {
                     let mut buf = vec![0u8; len];
-                    if read_exact_at(&self.file, &mut buf, sector * SECTOR).is_ok()
+                    if self
+                        .backend
+                        .read_exact_at(&mut buf, sector * SECTOR)
+                        .is_ok()
                         && wr.write_all(&buf).is_ok()
                     {
                         written = len as u32;
@@ -139,7 +209,7 @@ impl Block {
                 } else {
                     let mut buf = vec![0u8; len];
                     if rd.read_exact(&mut buf).is_err()
-                        || write_all_at(&self.file, &buf, sector * SECTOR).is_err()
+                        || self.backend.write_all_at(&buf, sector * SECTOR).is_err()
                     {
                         status = S_IOERR;
                     }
@@ -147,7 +217,7 @@ impl Block {
             }
             T_OUT => status = S_IOERR,
             T_FLUSH => {
-                if self.file.sync_data().is_err() {
+                if self.backend.flush().is_err() {
                     status = S_IOERR;
                 }
             }
@@ -173,7 +243,7 @@ impl Block {
 }
 
 /// Positional read of exactly `buf.len()` bytes at `off`.
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
     #[cfg(windows)]
@@ -193,7 +263,7 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<
 }
 
 /// Positional write of all of `buf` at `off`.
-fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
     #[cfg(windows)]

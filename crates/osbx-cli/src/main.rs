@@ -17,6 +17,8 @@ mod state;
 mod supervisor;
 #[cfg(any(target_os = "linux", windows))]
 mod sys;
+#[cfg(any(target_os = "linux", windows))]
+mod windows;
 
 use clap::{Args, Parser, Subcommand};
 use osbx_policy::{
@@ -80,6 +82,9 @@ struct CreateArgs {
     /// Root disk size, e.g. 40g or 20480m (default: image size + headroom, at least 2 GiB)
     #[arg(long, value_parser = parse_size)]
     disk: Option<u64>,
+    /// Guest OS (`linux` or `windows`; inferred automatically from Windows templates)
+    #[arg(long, value_parser = ["linux", "windows"])]
+    os: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -206,6 +211,51 @@ enum Cmd {
     Vmm {
         #[command(subcommand)]
         command: VmmCmd,
+    },
+    /// Windows-guest template and provisioning tools
+    Windows {
+        #[command(subcommand)]
+        command: WindowsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WindowsCmd {
+    /// Build a reusable Windows base template unattended from an ISO inside osbx-vmm (Linux/KVM)
+    BuildBase {
+        /// Windows installation ISO (e.g. Windows Server 2025 Evaluation ISO)
+        #[arg(long)]
+        iso: std::path::PathBuf,
+        /// Red Hat signed virtio-win.iso
+        #[arg(long)]
+        virtio_win: std::path::PathBuf,
+        /// Template name saved under $OSBX_HOME/templates/<name>
+        #[arg(long)]
+        name: String,
+        /// Image index inside install.wim (1 = Server Standard Core on Server 2025 Eval)
+        #[arg(long, default_value_t = 1)]
+        image_index: u32,
+        /// Virtual QCOW2 disk size in GiB
+        #[arg(long, default_value_t = 40)]
+        disk_gib: u64,
+        /// Guest RAM in MiB during install
+        #[arg(long, default_value_t = 4096)]
+        mem: usize,
+        /// vCPUs during install (1-32)
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=32))]
+        cpus: u8,
+        /// Path to OVMF_CODE_4M.fd (auto-detected if omitted)
+        #[arg(long)]
+        firmware_code: Option<std::path::PathBuf>,
+        /// Path to OVMF_VARS_4M.fd (auto-detected if omitted)
+        #[arg(long)]
+        firmware_vars: Option<std::path::PathBuf>,
+        /// Path to osbx-agent.exe (auto-detected if omitted)
+        #[arg(long)]
+        agent_exe: Option<std::path::PathBuf>,
+        /// Maximum minutes to wait for unattended setup
+        #[arg(long, default_value_t = 45)]
+        timeout_mins: u64,
     },
 }
 
@@ -461,6 +511,11 @@ fn create_opts(a: CreateArgs, agent: String) -> lifecycle::CreateOpts {
         docker: a.docker,
         template: a.template,
         root_size_mib: a.disk,
+        guest_os: match a.os.as_deref() {
+            Some("windows") => Some(state::GuestOs::Windows),
+            Some("linux") => Some(state::GuestOs::Linux),
+            _ => None,
+        },
         mounts: Default::default(),
     }
 }
@@ -499,10 +554,11 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                 .filter_map(|kv| kv.split_once('='))
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
-            // like the agent itself, commands start in the workspace unless told otherwise
+            // like the agent itself, Linux commands start in the workspace unless told otherwise
             let cwd = workdir.or_else(|| {
                 state::Record::load(&name)
                     .ok()
+                    .filter(|r| r.guest_os == state::GuestOs::Linux)
                     .and_then(|r| r.workspace)
                     .map(|w| state::guest_path(&w.host))
             });
@@ -591,6 +647,34 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                     detach,
                 },
         } => code(l::env_run(&file, &env_args, detach)),
+        Cmd::Windows {
+            command:
+                WindowsCmd::BuildBase {
+                    iso,
+                    virtio_win,
+                    name,
+                    image_index,
+                    disk_gib,
+                    mem,
+                    cpus,
+                    firmware_code,
+                    firmware_vars,
+                    agent_exe,
+                    timeout_mins,
+                },
+        } => done(windows::build_base(&windows::BuildBaseOpts {
+            iso,
+            virtio_win,
+            name,
+            image_index,
+            disk_gib,
+            mem_mib: mem,
+            cpus,
+            firmware_code,
+            firmware_vars,
+            agent_exe,
+            timeout_mins,
+        })),
         _ => unreachable!("not a lifecycle command"),
     }
 }
@@ -618,6 +702,7 @@ fn main() -> ExitCode {
             | Cmd::Ports { .. }
             | Cmd::Logs { .. }
             | Cmd::Save { .. }
+            | Cmd::Windows { .. }
             | Cmd::Templates
             | Cmd::Secret { .. }
             | Cmd::Supervise { .. }

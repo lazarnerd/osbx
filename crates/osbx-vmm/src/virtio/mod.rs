@@ -12,6 +12,7 @@ pub mod fs;
 #[path = "fs_windows.rs"]
 pub mod fs;
 pub mod mmio;
+pub mod scsi;
 pub mod vsock;
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -33,21 +34,61 @@ pub type GuestMem = GuestMemoryMmap<()>;
 /// A queue shared between the transport and a device.
 pub type SharedQueue = Arc<Mutex<Queue>>;
 
-/// Raises a device's interrupt line.
-#[derive(Clone)]
-pub struct Interrupt {
+/// Transport-specific interrupt delivery (MMIO single line or PCI INTx / per-queue MSI-X).
+pub trait InterruptSink: Send + Sync {
+    /// Deliver a configuration-change interrupt.
+    fn signal_config(&self);
+    /// Deliver a used-buffer interrupt for `queue`.
+    fn signal_queue(&self, queue: u16);
+}
+
+struct MmioInterruptSink {
     status: Arc<AtomicU32>,
     line: Irq,
 }
 
+impl InterruptSink for MmioInterruptSink {
+    fn signal_config(&self) {
+        self.status.fetch_or(INT_CONFIG, Ordering::SeqCst);
+        self.line.pulse();
+    }
+    fn signal_queue(&self, _queue: u16) {
+        self.status.fetch_or(INT_USED_RING, Ordering::SeqCst);
+        self.line.pulse();
+    }
+}
+
+/// Raises a device's interrupt (MMIO line, PCI INTx, or PCI MSI-X vector).
+#[derive(Clone)]
+pub struct Interrupt {
+    sink: Arc<dyn InterruptSink>,
+}
+
 impl Interrupt {
     pub(crate) fn new(status: Arc<AtomicU32>, line: Irq) -> Self {
-        Self { status, line }
+        Self {
+            sink: Arc::new(MmioInterruptSink { status, line }),
+        }
     }
-    /// Set `bit` in the interrupt status register and pulse the line.
+
+    /// Wrap a transport-provided [`InterruptSink`] (e.g., `virtio-pci` MSI-X/INTx).
+    pub fn from_sink(sink: Arc<dyn InterruptSink>) -> Self {
+        Self { sink }
+    }
+
+    /// Signal a used-buffer notification on `queue`.
+    pub fn signal_queue(&self, queue: u16) {
+        self.sink.signal_queue(queue);
+    }
+
+    /// Set `bit` in the interrupt status register and pulse the line (queue 0 for `INT_USED_RING`).
     pub fn signal(&self, bit: u32) {
-        self.status.fetch_or(bit, Ordering::SeqCst);
-        self.line.pulse();
+        if bit & INT_CONFIG != 0 {
+            self.sink.signal_config();
+        }
+        if bit & INT_USED_RING != 0 {
+            self.sink.signal_queue(0);
+        }
     }
 }
 
