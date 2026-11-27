@@ -18,14 +18,17 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use osbx_proto::{
-        AGENT_PORT, CHUNK, EGRESS_PORT, ERROR, EXEC, EXIT, ExecRequest, GUEST_PROXY_BIND, POWEROFF,
-        RESIZE, SIGNAL, STDERR, STDIN, STDIN_EOF, STDOUT, TUNNEL_PORT, read_frame, write_frame,
+        AGENT_PORT, CHUNK, EGRESS_PORT, ERROR, EXEC, EXIT, ExecRequest, GUEST_PROXY_BIND,
+        GUEST_SSH_AUTH_SOCK, POWEROFF, RESIZE, SIGNAL, SSH_AGENT_PORT, STDERR, STDIN, STDIN_EOF,
+        STDOUT, TUNNEL_PORT, read_frame, write_frame,
     };
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::{self, BufReader, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::{Command, Stdio};
     use std::sync::{Arc, LazyLock, Mutex, mpsc};
     use std::thread;
@@ -110,6 +113,13 @@ mod linux {
         thread::spawn(|| accept_loop(AGENT_PORT, handle_control));
         thread::spawn(|| accept_loop(TUNNEL_PORT, handle_tunnel));
         thread::spawn(egress_listener);
+        if std::fs::read_to_string("/proc/cmdline")
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|a| a == "osbx.ssh_agent=1")
+        {
+            thread::spawn(ssh_agent_listener);
+        }
         loop {
             thread::sleep(Duration::from_secs(3600));
         }
@@ -265,6 +275,48 @@ mod linux {
         match TcpStream::connect(target.trim()) {
             Ok(tcp) => bridge(conn, tcp),
             Err(e) => eprintln!("osbx-agent: tunnel to {target}: {e}"),
+        }
+    }
+
+    /// Pipe bytes both ways between a vsock stream and a Unix socket until both sides finish.
+    fn bridge_unix(vs: File, unix: UnixStream) {
+        let (Ok(vs2), Ok(unix2)) = (vs.try_clone(), unix.try_clone()) else {
+            return;
+        };
+        let up = thread::spawn(move || {
+            let (mut from, mut to) = (vs, unix2);
+            let _ = io::copy(&mut from, &mut to);
+            let _ = to.shutdown(Shutdown::Write);
+        });
+        let (mut from, mut to) = (unix, vs2);
+        let _ = io::copy(&mut from, &mut to);
+        shutdown_write(&to);
+        let _ = up.join();
+    }
+
+    // ---- ssh-agent: guest-local Unix socket -> host -------------------------------------------
+
+    fn ssh_agent_listener() {
+        let path = std::path::Path::new(GUEST_SSH_AUTH_SOCK);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_file(path);
+        let listener = match UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("osbx-agent: bind {GUEST_SSH_AUTH_SOCK}: {e}");
+                return;
+            }
+        };
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+        eprintln!("osbx-agent: ssh-agent on {GUEST_SSH_AUTH_SOCK}");
+        for conn in listener.incoming().flatten() {
+            thread::spawn(move || match vsock_connect(HOST_CID, SSH_AGENT_PORT) {
+                Ok(vs) => bridge_unix(vs, conn),
+                Err(e) => eprintln!("osbx-agent: host ssh-agent unreachable: {e}"),
+            });
         }
     }
 

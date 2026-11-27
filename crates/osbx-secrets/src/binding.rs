@@ -35,6 +35,9 @@ impl Bindings {
     ///   apiKey: {domains: [api.github.com]}
     /// ```
     pub fn from_yaml(s: &str) -> Result<Self, String> {
+        if s.trim().is_empty() {
+            return Ok(Self::default());
+        }
         serde_yaml_ng::from_str(s).map_err(|e| e.to_string())
     }
     /// Serialize to YAML.
@@ -54,6 +57,33 @@ impl Bindings {
                 e.domains.push((*d).to_owned());
             }
         }
+    }
+    /// Revoke a binding for `service` (one `mechanism`, or all mechanisms when `None`).
+    /// Returns `true` if anything was removed.
+    pub fn revoke(&mut self, service: &str, mechanism: Option<Mechanism>) -> bool {
+        match mechanism {
+            None => self.0.remove(service).is_some(),
+            Some(m) => {
+                let Some(map) = self.0.get_mut(service) else {
+                    return false;
+                };
+                let removed = map.remove(&m).is_some();
+                if map.is_empty() {
+                    self.0.remove(service);
+                }
+                removed
+            }
+        }
+    }
+    /// All approved `(service, mechanism, domains)` bindings, sorted.
+    pub fn entries(&self) -> Vec<(String, Mechanism, Vec<String>)> {
+        let mut out = Vec::new();
+        for (svc, mechs) in &self.0 {
+            for (m, e) in mechs {
+                out.push((svc.clone(), *m, e.domains.clone()));
+            }
+        }
+        out
     }
     /// Is any binding present for `service`/`mechanism`?
     pub fn has(&self, service: &str, mechanism: Mechanism) -> bool {
@@ -105,5 +135,9 @@ mod tests {
         b.approve("github", Mechanism::ApiKey, &["a.com", "b.com"]);
         assert!(b.allows("github", Mechanism::ApiKey, "b.com"));
         assert_eq!(b.to_yaml().matches("a.com").count(), 1);
+        assert_eq!(b.entries().len(), 1);
+        assert!(b.revoke("github", Some(Mechanism::ApiKey)));
+        assert!(!b.has("github", Mechanism::ApiKey));
+        assert!(Bindings::from_yaml("").unwrap().entries().is_empty());
     }
 }

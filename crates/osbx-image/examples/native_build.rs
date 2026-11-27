@@ -81,6 +81,7 @@ fn main() {
         upstream: None,
         client_tls: None,
         events: None,
+        ssh_agent: None,
     })
     .expect("start");
     sb.wait_ready(Duration::from_secs(60)).expect("ready");

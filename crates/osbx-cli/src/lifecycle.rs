@@ -216,6 +216,8 @@ pub struct CreateOpts {
     pub cpus: u8,
     /// Kits (local directories or image references).
     pub kits: Vec<String>,
+    /// Kit arguments (`KIT.NAME=VALUE` or `NAME=VALUE`).
+    pub kit_args: Vec<String>,
     /// Give the sandbox usable /dev/kvm (a `kvm@1` grant).
     pub kvm: bool,
     /// Run Docker Engine inside the sandbox.
@@ -286,11 +288,14 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
         ));
     }
     // kits: load and validate, compose, select capabilities against this host
-    let mut kits = o
-        .kits
-        .iter()
-        .map(|k| crate::kits::load(k))
-        .collect::<io::Result<Vec<_>>>()?;
+    let supplied_args = crate::kits::SuppliedKitArgs::parse(&o.kit_args)?;
+    let mut kits = Vec::with_capacity(o.kits.len());
+    let mut used_unscoped = std::collections::BTreeSet::new();
+    for k in &o.kits {
+        let (rec, used) = crate::kits::load(k, &supplied_args)?;
+        used_unscoped.extend(used);
+        kits.push(rec);
+    }
     if o.kvm {
         kits.push(crate::kits::KitRecord {
             source: "--kvm".into(),
@@ -300,18 +305,42 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
             image: None,
             granted: vec![],
             skipped: vec![],
+            env: BTreeMap::new(),
         });
     }
     // an agent image that is itself a workload kit (sbx/claude, ...) is composed as one
     if o.image.is_none()
         && o.template.is_none()
         && !kits.iter().any(|k| k.kind == "workload")
-        && let Some(w) = crate::kits::workload_for_image(&image_for(&o.agent))?
+        && let Some((w, used)) =
+            crate::kits::workload_for_image(&image_for(&o.agent), &supplied_args)?
     {
+        used_unscoped.extend(used);
         kits.insert(0, w);
     }
+    for handle in supplied_args.by_kit.keys() {
+        if !kits.iter().any(|k| &k.handle == handle) {
+            return Err(io::Error::other(format!(
+                "--kit-arg: no kit with handle {handle:?} in this sandbox"
+            )));
+        }
+    }
+    for name in supplied_args.unscoped.keys() {
+        if !used_unscoped.contains(name) {
+            return Err(io::Error::other(format!(
+                "--kit-arg {name:?}: no kit declares this argument"
+            )));
+        }
+    }
     let kvm_available = osbx_vmm::probe().nested_ready();
-    crate::kits::plan(&mut kits, kvm_available)?;
+    let ssh_agent_available = crate::kits::host_ssh_auth_sock().is_some();
+    crate::kits::plan(&mut kits, kvm_available, ssh_agent_available)?;
+    if let Some(bindings) = crate::state::load_bindings()? {
+        crate::kits::check_credential_bindings(&kits, &bindings).map_err(io::Error::other)?;
+    }
+    let kit_res = crate::kits::resources(&kits);
+    let mem_mib = kit_res.mem_mib.map_or(o.mem_mib, |m| o.mem_mib.max(m));
+    let cpus = kit_res.cpus.map_or(o.cpus, |c| o.cpus.max(c));
     for k in &kits {
         eprintln!("kit {}", crate::kits::describe(k));
     }
@@ -395,8 +424,8 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
             },
         }),
         env,
-        mem_mib: o.mem_mib,
-        cpus: o.cpus,
+        mem_mib,
+        cpus,
         root_size_mib: o.root_size_mib,
         kits,
         docker: o.docker,
@@ -865,6 +894,90 @@ pub fn secret_rm(service: &str, sandbox: Option<String>) -> io::Result<()> {
     Ok(())
 }
 
+fn parse_mechanism(s: &str) -> io::Result<osbx_secrets::Mechanism> {
+    match s {
+        "api-key" | "apiKey" => Ok(osbx_secrets::Mechanism::ApiKey),
+        "oauth" => Ok(osbx_secrets::Mechanism::Oauth),
+        other => Err(io::Error::other(format!(
+            "unknown mechanism {other:?} (api-key | oauth)"
+        ))),
+    }
+}
+
+/// `osbx secret bind SERVICE [--mechanism api-key|oauth] [--domain D]...`.
+pub fn secret_bind(service: &str, mechanism: &str, domains: &[String]) -> io::Result<()> {
+    let mech = parse_mechanism(mechanism)?;
+    let doms: Vec<String> = if domains.is_empty() && mech == osbx_secrets::Mechanism::ApiKey {
+        match osbx_secrets::find_service(service) {
+            Some(svc) => svc.inject_rules().into_iter().map(|r| r.domain).collect(),
+            None => {
+                return Err(io::Error::other(format!(
+                    "service {service:?} is not built-in: pass at least one --domain"
+                )));
+            }
+        }
+    } else if domains.is_empty() {
+        return Err(io::Error::other("pass at least one --domain"));
+    } else {
+        domains.to_vec()
+    };
+    for d in &doms {
+        d.parse::<osbx_policy::Destination>()
+            .map_err(|e| io::Error::other(format!("domain {d:?}: {e}")))?;
+    }
+    let mut b = crate::state::load_bindings()?.unwrap_or_default();
+    let refs: Vec<&str> = doms.iter().map(String::as_str).collect();
+    b.approve(service, mech, &refs);
+    let path = crate::state::bindings_path();
+    if let Some(parent) = path.parent() {
+        crate::sys::create_private_dir(parent)?;
+    }
+    crate::sys::write_private(&path, b.to_yaml().as_bytes())?;
+    Ok(())
+}
+
+/// `osbx secret unbind SERVICE [--mechanism api-key|oauth]`.
+pub fn secret_unbind(service: &str, mechanism: Option<&str>) -> io::Result<()> {
+    let mech = mechanism.map(parse_mechanism).transpose()?;
+    let mut b = crate::state::load_bindings()?.unwrap_or_default();
+    if !b.revoke(service, mech) {
+        return Err(io::Error::other(format!(
+            "no binding for service {service:?}"
+        )));
+    }
+    let path = crate::state::bindings_path();
+    if let Some(parent) = path.parent() {
+        crate::sys::create_private_dir(parent)?;
+    }
+    crate::sys::write_private(&path, b.to_yaml().as_bytes())?;
+    Ok(())
+}
+
+/// `osbx secret bindings`: list approved credential bindings.
+pub fn secret_bindings() -> io::Result<()> {
+    match crate::state::load_bindings()? {
+        None => println!(
+            "no credentials.yaml (all stored secrets allowed; run `osbx secret bind` to enforce bindings)"
+        ),
+        Some(b) => {
+            let entries = b.entries();
+            if entries.is_empty() {
+                println!(
+                    "no approved bindings (credentials.yaml is active: all injections withheld)"
+                );
+            }
+            for (svc, mech, doms) in entries {
+                let m = match mech {
+                    osbx_secrets::Mechanism::ApiKey => "api-key",
+                    osbx_secrets::Mechanism::Oauth => "oauth",
+                };
+                println!("{svc:<16} {m:<8} {}", doms.join(", "));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- sbxenv.yaml -------------------------------------------------------------------------
 
 /// Parse `"16g"`, `"512m"`, `"2048"` (MiB) into MiB.
@@ -919,6 +1032,15 @@ pub fn env_run(file: &Path, env_args: &[String], detach: bool) -> io::Result<i32
             k.source()
         )));
     }
+    let mut env_kit_args = Vec::new();
+    for k in &e.kits {
+        if let osbx_env::KitEntry::Full(f) = k {
+            let handle = k.handle();
+            for (arg, val) in &f.args {
+                env_kit_args.push(format!("{handle}.{arg}={val}"));
+            }
+        }
+    }
     let (ws, clone) = match &e.workspace {
         None => (None, false),
         Some(osbx_env::Workspace::Path(p)) => (Some(dir.join(p)), false),
@@ -944,6 +1066,7 @@ pub fn env_run(file: &Path, env_args: &[String], detach: bool) -> io::Result<i32
             .filter(|c| *c > 0)
             .map_or(2, |c| u8::try_from(c.min(32)).unwrap_or(32)),
         kits: kit_sources,
+        kit_args: env_kit_args,
         kvm: false,
         docker: false,
         template: None,

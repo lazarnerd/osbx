@@ -43,7 +43,7 @@ osbx run shell                   # the project appears in the sandbox at /c/src/
 
 | Command | What it does |
 |---|---|
-| `osbx create [--name N] [--image IMG] [-w DIR \| --no-workspace] [--clone] [--kit K]... [--kvm] [--docker] [--template T] [-e K=V] [--mem MiB] [--cpus N] [--disk 40g] [AGENT]` | Create a sandbox (root filesystem built from the image, cached) |
+| `osbx create [--name N] [--image IMG] [-w DIR \| --no-workspace] [--clone] [--kit K]... [--kit-arg [K.]A=V]... [--kvm] [--docker] [--template T] [-e K=V] [--mem MiB] [--cpus N] [--disk 40g] [AGENT]` | Create a sandbox (root filesystem built from the image, cached) |
 | `osbx run [create flags] [AGENT] [-- CMD...]` | Create if needed, start if needed, attach to the agent (TTY when interactive) |
 | `osbx start/stop NAME`, `osbx rm [-f] NAME`, `osbx ls` | Lifecycle; the root disk persists across stop/start |
 | `osbx exec [-i] [-t] [-u USER] [-w DIR] [-e K=V] NAME -- CMD` | Run a command (exit status and stderr pass through) |
@@ -53,7 +53,7 @@ osbx run shell                   # the project appears in the sandbox at /c/src/
 | `osbx save NAME TEMPLATE`, `osbx templates`, `osbx create --template T` | Reuse a configured root disk |
 | `osbx policy ls \| init PRESET \| allow DEST \| deny DEST \| rm DEST [--sandbox N]` | Network policy (live: running sandboxes reload) |
 | `osbx policy pending NAME`, `osbx policy approve NAME DEST [--all-sandboxes]` | Destinations refused for want of a rule, and approving them |
-| `osbx secret set SERVICE [--sandbox N] [--command CMD \| --ref REF]`, `ls`, `rm` | Credentials the proxy injects (value from stdin by default) |
+| `osbx secret set SERVICE [--sandbox N] [--command CMD \| --ref REF]`, `ls`, `rm`, `bind`, `unbind`, `bindings` | Credentials the proxy injects (value from stdin by default) and `credentials.yaml` domain bindings |
 | `osbx env run [FILE] [--env-arg k=v] [-d]` | Run the environment described by an `sbxenv.yaml` |
 | `osbx kit validate FILE...`, `osbx env check [FILE]`, `osbx policy check ...` | Offline validation tools |
 | `osbx vmm probe [--run-guest] [--require-nested]`, `osbx vmm boot --kernel K --initrd I` | Hypervisor tools |
@@ -100,7 +100,7 @@ selection), `osbx-secrets` (stores, sources, injection), `osbx-proxy` (egress pr
 
 ## Tests
 
-`cargo test --workspace` (129 tests). Tests that need KVM, guest assets, Docker images or the
+`cargo test --workspace` (138 tests). Tests that need KVM, guest assets, Docker images or the
 spec checkout skip with a note when those are missing; set `OSBX_SPEC_EXAMPLES` to
 `<sandbox-kit-spec>/examples` to check all upstream example kits.
 

@@ -61,6 +61,9 @@ struct CreateArgs {
     /// Kit to compose: a local directory or an image reference (repeatable)
     #[arg(long = "kit")]
     kits: Vec<String>,
+    /// Argument for a kit: `KIT.NAME=VALUE` or `NAME=VALUE` (repeatable)
+    #[arg(long = "kit-arg")]
+    kit_args: Vec<String>,
     /// Give the sandbox usable /dev/kvm and /dev/vhost-vsock (a kvm@1 grant; needs nested virtualization)
     #[arg(long)]
     kvm: bool,
@@ -306,6 +309,27 @@ enum SecretCmd {
         #[arg(long)]
         sandbox: Option<String>,
     },
+    /// Approve credential injection for a service and domain(s) in credentials.yaml
+    Bind {
+        /// Service
+        service: String,
+        /// Mechanism (api-key | oauth)
+        #[arg(long, default_value = "api-key")]
+        mechanism: String,
+        /// Allowed domain pattern (repeatable; defaults to built-in domains for built-in API-key services)
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+    },
+    /// Revoke an approved credential binding from credentials.yaml
+    Unbind {
+        /// Service
+        service: String,
+        /// Only this mechanism (api-key | oauth); omit to remove all
+        #[arg(long)]
+        mechanism: Option<String>,
+    },
+    /// List approved credential bindings in credentials.yaml
+    Bindings,
 }
 
 #[derive(Subcommand)]
@@ -428,6 +452,7 @@ fn create_opts(a: CreateArgs, agent: String) -> lifecycle::CreateOpts {
         mem_mib: a.mem,
         cpus: a.cpus,
         kits: a.kits,
+        kit_args: a.kit_args,
         kvm: a.kvm,
         docker: a.docker,
         template: a.template,
@@ -513,6 +538,20 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
         Cmd::Secret {
             command: SecretCmd::Rm { service, sandbox },
         } => done(l::secret_rm(&service, sandbox)),
+        Cmd::Secret {
+            command:
+                SecretCmd::Bind {
+                    service,
+                    mechanism,
+                    domains,
+                },
+        } => done(l::secret_bind(&service, &mechanism, &domains)),
+        Cmd::Secret {
+            command: SecretCmd::Unbind { service, mechanism },
+        } => done(l::secret_unbind(&service, mechanism.as_deref())),
+        Cmd::Secret {
+            command: SecretCmd::Bindings,
+        } => done(l::secret_bindings()),
         Cmd::Supervise { name } => done(supervisor::supervise(&name)),
         Cmd::Policy {
             command: PolicyCmd::Ls,

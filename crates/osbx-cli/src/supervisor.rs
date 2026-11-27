@@ -28,6 +28,8 @@ struct StoreCredentials {
     store: FileStore,
     sandbox: String,
     kit: Vec<crate::kits::KitCredential>,
+    /// When `credentials.yaml` exists, only bound `(service, mechanism, host)` tuples are injected.
+    bindings: Option<osbx_secrets::Bindings>,
 }
 
 /// Where a service's OAuth tokens live: a global entry, so a login made in one sandbox serves
@@ -67,6 +69,11 @@ impl Credentials for StoreCredentials {
         };
         self.kit.iter().find_map(|kc| {
             let o = kc.oauth.as_ref()?;
+            if let Some(b) = &self.bindings
+                && !b.allows(&kc.service, osbx_secrets::Mechanism::Oauth, host)
+            {
+                return None;
+            }
             (o.token_host == host || o.resource_hosts.iter().any(|r| covers(r))).then(|| {
                 osbx_proxy::OAuthSpec {
                     service: kc.service.clone(),
@@ -102,8 +109,13 @@ impl Credentials for StoreCredentials {
             d.parse::<osbx_policy::Destination>()
                 .is_ok_and(|d| d.matches(host, None, 443))
         };
+        let allowed = |service: &str| -> bool {
+            self.bindings
+                .as_ref()
+                .is_none_or(|b| b.allows(service, osbx_secrets::Mechanism::ApiKey, host))
+        };
         for kc in &self.kit {
-            if !kc.inject.iter().any(|(d, _, _)| covers(d)) {
+            if !kc.inject.iter().any(|(d, _, _)| covers(d)) || !allowed(&kc.service) {
                 continue;
             }
             if let Ok(Some(secret)) = self.resolver.resolve(&self.sandbox, &kc.service) {
@@ -121,6 +133,9 @@ impl Credentials for StoreCredentials {
             }
         }
         for svc in builtin_services() {
+            if !allowed(svc.name) {
+                continue;
+            }
             let rules = svc.inject_rules();
             let matches = rules.iter().any(|r| {
                 r.domain
@@ -146,15 +161,17 @@ fn effective_policy(rec: &Record, phase: &str) -> Result<PolicySet, String> {
     let mut p = StoredPolicy::load()
         .map_err(|e| e.to_string())?
         .to_policy()?;
-    for (kit, (allow, dest, ph)) in crate::kits::network_rules(&rec.kits) {
-        if ph == "runtime" || ph == phase {
-            let action = if allow {
+    for r in crate::kits::network_rules(&rec.kits) {
+        if r.phase == "runtime" || r.phase == phase {
+            let action = if r.allow {
                 osbx_policy::Action::Allow
             } else {
                 osbx_policy::Action::Deny
             };
-            let rule = osbx_policy::Rule::new(action, &dest, osbx_policy::Origin::Kit(kit.clone()))
-                .map_err(|e| format!("kit {kit}: {dest}: {e}"))?;
+            let mut rule =
+                osbx_policy::Rule::new(action, &r.dest, osbx_policy::Origin::Kit(r.kit.clone()))
+                    .map_err(|e| format!("kit {}: {}: {e}", r.kit, r.dest))?;
+            rule.http = r.http;
             p.rules.push(rule);
         }
     }
@@ -226,11 +243,13 @@ pub fn supervise(name: &str) -> io::Result<()> {
     let kit_creds = crate::kits::credentials(&rec.kits);
     let oauth_store = FileStore::open(crate::state::home().join("secrets"))
         .map_err(|e| io::Error::other(e.to_string()))?;
+    let bindings = crate::state::load_bindings()?;
     let credentials = Arc::new(StoreCredentials {
         resolver: Resolver::new(store),
         store: oauth_store,
         sandbox: name.to_owned(),
         kit: kit_creds.clone(),
+        bindings,
     });
 
     let mut shares = Vec::new();
@@ -280,7 +299,23 @@ pub fn supervise(name: &str) -> io::Result<()> {
             read_only: false,
         });
     }
+    // kit volume@1: persistent per-sandbox directory (survives stop/start, deleted on rm)
+    for v in crate::kits::volumes(&rec.kits) {
+        let host_dir = dir
+            .join("volumes")
+            .join(v.path.trim_start_matches('/').replace('/', "_"));
+        std::fs::create_dir_all(&host_dir)?;
+        shares.push(Share {
+            host_dir,
+            guest_path: v.path,
+            read_only: false,
+        });
+    }
     let mut env = launch_env.clone();
+    // kit create-phase args with `env:` delivery (user `-e` overrides them)
+    for k in &rec.kits {
+        env.extend(k.env.clone());
+    }
     env.extend(rec.env.clone());
     // Node-based agents (Claude Code) do not read the system CA bundle: point them at the
     // sandbox CA so intercepted hosts (credential injection, OAuth) are trusted
@@ -342,6 +377,27 @@ pub fn supervise(name: &str) -> io::Result<()> {
             }
         });
     }
+    let kit_ssh = crate::kits::ssh_agent(&rec.kits);
+    let ssh_agent = match &kit_ssh {
+        Some(sa) => {
+            let socket = crate::kits::host_ssh_auth_sock().ok_or_else(|| {
+                io::Error::other(
+                    "a kit requires ssh-agent@1, but SSH_AUTH_SOCK is not set or missing",
+                )
+            })?;
+            let policy = if sa.unrestricted {
+                osbx_sandbox::ssh_agent::SshAgentPolicy::Unrestricted
+            } else {
+                osbx_sandbox::ssh_agent::SshAgentPolicy::SignOnly(sa.sign.clone())
+            };
+            Some(osbx_sandbox::ssh_agent::SshAgentConfig { socket, policy })
+        }
+        None => None,
+    };
+    if kit_ssh.as_ref().is_some_and(|sa| sa.runtime) {
+        env.entry("SSH_AUTH_SOCK".into())
+            .or_insert_with(|| osbx_proto::GUEST_SSH_AUTH_SOCK.into());
+    }
     // a larger disk size in the record (CLI --disk or sbxenv rootSize) is applied before boot
     if let Some(mib) = rec.root_size_mib {
         crate::lifecycle::grow_disk(&dir.join("root.img"), mib)?;
@@ -374,6 +430,7 @@ pub fn supervise(name: &str) -> io::Result<()> {
         upstream: None,
         client_tls: None,
         events: Some(ev_tx),
+        ssh_agent,
     })?;
     sb.wait_ready(Duration::from_secs(120))?;
     first_boot_setup(&sb, &rec, &ca_pem);
@@ -382,6 +439,25 @@ pub fn supervise(name: &str) -> io::Result<()> {
         return Err(e);
     }
     write_oauth_files(&sb, &rec, &kit_creds);
+
+    // kit port@1: publish declared TCP ports on loopback with an ephemeral host port
+    let mut initial_ports = Vec::new();
+    for kp in crate::kits::ports(&rec.kits) {
+        match sb.publish_port("127.0.0.1:0".parse().unwrap(), kp.container) {
+            Ok(addr) => {
+                eprintln!(
+                    "kit port{}: published {addr} -> sandbox port {}",
+                    kp.name
+                        .as_deref()
+                        .map(|n| format!(" {n}"))
+                        .unwrap_or_default(),
+                    kp.container
+                );
+                initial_ports.push((addr, kp.container));
+            }
+            Err(e) => eprintln!("warning: kit port {}: {e}", kp.container),
+        }
+    }
 
     let sock = control_socket(name);
     if let Some(parent) = sock.parent() {
@@ -395,7 +471,7 @@ pub fn supervise(name: &str) -> io::Result<()> {
         sb,
         policy,
         pending,
-        ports: Mutex::new(Vec::new()),
+        ports: Mutex::new(initial_ports),
         launch_env,
     });
 
@@ -459,10 +535,22 @@ usermod -aG kvm "$name" 2>/dev/null || adduser "$name" kvm >/dev/null 2>&1 || \
     }
 }
 
-/// Hostname, CA trust and (clone mode) the private clone. Idempotent per boot.
+/// Hostname, CA trust and volume permissions. Idempotent per boot.
 fn first_boot_setup(sb: &Sandbox, rec: &Record, ca_pem: &str) {
     if crate::kits::wants_kvm(&rec.kits) {
         kvm_access_setup(sb, rec);
+    }
+    for v in crate::kits::volumes(&rec.kits) {
+        if let Some(mode) = v.mode {
+            let _ = sb.exec(
+                &[
+                    "/bin/sh",
+                    "-c",
+                    &format!("chmod {mode} '{}'", v.path.replace('\'', "'\\''")),
+                ],
+                None,
+            );
+        }
     }
     if crate::kits::sbx_platform(&rec.kits) {
         let owner = if rec.launch.user.is_empty() {
@@ -631,9 +719,16 @@ fn run_kit_lifecycle(
     if !install.is_empty() && !marker.exists() {
         // install-phase rules: open now, closed again before the agent runs
         *policy.write().unwrap() = effective_policy(rec, "install").map_err(io::Error::other)?;
+        let install_ssh = crate::kits::ssh_agent(&rec.kits).is_some_and(|sa| sa.install);
         let result = install.iter().try_for_each(|h| {
             // install hooks see only the variables they declare (deny by default), not the proxy settings
             let mut env = env_for(&h.env);
+            if install_ssh {
+                env.insert(
+                    "SSH_AUTH_SOCK".into(),
+                    osbx_proto::GUEST_SSH_AUTH_SOCK.into(),
+                );
+            }
             for k in [
                 "http_proxy",
                 "https_proxy",

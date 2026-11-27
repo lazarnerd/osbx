@@ -159,6 +159,7 @@ pub fn build_rootfs_native(
         upstream: None,
         client_tls: None,
         events: None,
+        ssh_agent: None,
     })?;
     let result = (|| {
         sb.wait_ready(Duration::from_secs(60))?;

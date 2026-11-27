@@ -212,6 +212,41 @@ fn credential_and_policy_cross_rules() {
 }
 
 #[test]
+fn network_policy_v2_rules_and_credential_cross_check() {
+    let doc = |body: &str| format!("{HEAD}capabilities:\n{body}");
+    assert!(
+        issues(&doc(
+            "  - type: com.docker.sandbox/network-policy@2\n    config:\n      runtime:\n        allow:\n          - github.com\n          - hosts: [api.github.com]\n            methods: [GET, POST]\n            paths: [\"/repos/**\"]\n        deny:\n          - hosts: [api.github.com]\n            methods: [DELETE]\n            paths: [\"/repos/**\"]\n  - type: com.docker.sandbox/credential@1\n    config:\n      service: github\n      phase: runtime\n      apiKey:\n        name: GH_TOKEN\n        inject:\n          - {domain: api.github.com, header: Authorization, format: \"Bearer %s\"}\n"
+        ))
+        .is_empty()
+    );
+    has(
+        &doc(
+            "  - type: com.docker.sandbox/network-policy@2\n    config:\n      runtime:\n        allow:\n          - hosts: []\n            methods: [GET]\n",
+        ),
+        "at least one host",
+    );
+    has(
+        &doc(
+            "  - type: com.docker.sandbox/network-policy@2\n    config:\n      runtime:\n        allow:\n          - hosts: [api.example.com]\n            paths: [relative/path]\n",
+        ),
+        "must start with '/'",
+    );
+    has(
+        &doc(
+            "  - type: com.docker.sandbox/network-policy@2\n    config:\n      runtime:\n        allow:\n          - hosts: [api.example.com]\n            methods: [GET1]\n",
+        ),
+        "invalid HTTP method",
+    );
+    has(
+        &doc(
+            "  - type: com.docker.sandbox/network-policy@2\n    config:\n      runtime:\n        allow: [other.example.com]\n  - type: com.docker.sandbox/credential@1\n    config:\n      service: github\n      phase: runtime\n      apiKey:\n        name: GH_TOKEN\n        inject:\n          - {domain: api.github.com}\n",
+        ),
+        "allows no such host",
+    );
+}
+
+#[test]
 fn storage_rules() {
     let cap = |body: &str| format!("{HEAD}capabilities:\n{body}");
     has(
@@ -240,6 +275,53 @@ fn storage_rules() {
     );
     // a reference defers typed checks to the effective form
     assert!(issues(&format!("{HEAD}args: {{p: {{default: /a}}}}\ncapabilities:\n  - type: com.docker.sandbox/host-mount@1\n    config: {{path: \"${{{{ kit.args.p }}}}\"}}\n")).is_empty());
+}
+
+#[test]
+fn port_and_resources_rules() {
+    let cap = |body: &str| format!("{HEAD}capabilities:\n{body}");
+    assert!(
+        issues(&cap(
+            "  - type: com.docker.sandbox/port@1\n    config: {name: web, container: 3000, transport: tcp, family: ipv4}\n  - type: com.docker.sandbox/resources@1\n    config: {cpu: 4.0, memory: 8gib}\n"
+        ))
+        .is_empty()
+    );
+    has(
+        &cap("  - type: com.docker.sandbox/port@1\n    config: {container: 0}\n"),
+        "1..=65535",
+    );
+    has(
+        &cap("  - type: com.docker.sandbox/port@1\n    config: {container: 80, transport: sctp}\n"),
+        "unknown transport",
+    );
+    has(
+        &cap("  - type: com.docker.sandbox/resources@1\n    config: {cpu: -1}\n"),
+        ">= 0",
+    );
+    has(
+        &cap("  - type: com.docker.sandbox/resources@1\n    config: {memory: nope}\n"),
+        "invalid memory size",
+    );
+}
+
+#[test]
+fn ssh_agent_rules() {
+    let cap = |body: &str| format!("{HEAD}capabilities:\n{body}");
+    assert!(
+        issues(&cap(
+            "  - type: com.docker.sandbox/ssh-agent@1\n    config: {phase: [install, runtime], unrestricted: false, sign: [git]}\n"
+        ))
+        .is_empty()
+    );
+    assert!(issues(&cap("  - type: com.docker.sandbox/ssh-agent@1\n")).is_empty());
+    has(
+        &cap("  - type: com.docker.sandbox/ssh-agent@1\n    config: {unrestricted: false}\n"),
+        "at least one of sign/authenticate",
+    );
+    has(
+        &cap("  - type: com.docker.sandbox/ssh-agent@1\n    config: {phase: build}\n"),
+        "unknown phase",
+    );
 }
 
 #[test]

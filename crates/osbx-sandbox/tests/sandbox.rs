@@ -106,6 +106,7 @@ fn start(upstream: Option<SocketAddr>) -> Option<Fixture> {
         upstream: upstream.map(|a| Arc::new(Fixed(a)) as Arc<dyn Upstream>),
         client_tls: Some(web_pki_client_config()),
         events: Some(tx),
+        ssh_agent: None,
     })
     .expect("start");
     sb.wait_ready(Duration::from_secs(60)).expect("agent ready");
@@ -324,6 +325,7 @@ fn boots_a_real_root_filesystem_built_from_an_oci_image() {
         upstream: None,
         client_tls: None,
         events: None,
+        ssh_agent: None,
     })
     .expect("start");
     sb.wait_ready(Duration::from_secs(90)).expect("agent ready");
@@ -429,19 +431,29 @@ fn shared_workspace_is_live_in_both_directions() {
     };
     let host_dir = std::env::temp_dir().join(format!("osbx-share-{}", std::process::id()));
     let _cleanup = TempDir(host_dir.clone());
+    let ro_dir = host_dir.join("_ro_source");
     std::fs::create_dir_all(host_dir.join("src")).unwrap();
+    std::fs::create_dir_all(&ro_dir).unwrap();
     std::fs::write(host_dir.join("src/main.txt"), "from the host\n").unwrap();
+    std::fs::write(ro_dir.join("keep.txt"), "immutable\n").unwrap();
     let sb = Sandbox::start(SandboxConfig {
         name: "share".into(),
         kernel,
         initrd,
         disks: vec![],
         extra_cmdline: String::new(),
-        shares: vec![osbx_sandbox::Share {
-            host_dir: host_dir.clone(),
-            guest_path: "/workspace".into(),
-            read_only: false,
-        }],
+        shares: vec![
+            osbx_sandbox::Share {
+                host_dir: host_dir.clone(),
+                guest_path: "/workspace".into(),
+                read_only: false,
+            },
+            osbx_sandbox::Share {
+                host_dir: ro_dir.clone(),
+                guest_path: "/ro".into(),
+                read_only: true,
+            },
+        ],
         mem_mib: 256,
         cpus: 2,
         policy: Arc::new(RwLock::new(PolicySet::new(Preset::DenyAll))),
@@ -451,6 +463,7 @@ fn shared_workspace_is_live_in_both_directions() {
         upstream: None,
         client_tls: None,
         events: None,
+        ssh_agent: None,
     })
     .expect("start");
     {
@@ -505,6 +518,33 @@ fn shared_workspace_is_live_in_both_directions() {
             "{:?}",
             esc
         );
+        // host-enforced read-only share: even if guest root remounts it rw, every mutation fails
+        let ro = sb
+            .exec(
+                &[
+                    "/bin/sh",
+                    "-c",
+                    "cat /ro/keep.txt; \
+                     mount -o remount,rw /ro 2>/dev/null; \
+                     (echo bad > /ro/keep.txt) 2>/dev/null && echo WROTE; \
+                     touch /ro/new 2>/dev/null && echo CREATED; \
+                     mkdir /ro/sub 2>/dev/null && echo MKDIR; \
+                     rm /ro/keep.txt 2>/dev/null && echo REMOVED; \
+                     mv /ro/keep.txt /ro/moved 2>/dev/null && echo MOVED; \
+                     chmod 777 /ro/keep.txt 2>/dev/null && echo CHMOD; \
+                     echo ro-done",
+                ],
+                None,
+            )
+            .unwrap();
+        assert_eq!(ro.stdout_str(), "immutable\nro-done\n", "{:?}", ro);
+        assert_eq!(
+            std::fs::read_to_string(ro_dir.join("keep.txt")).unwrap(),
+            "immutable\n"
+        );
+        assert!(!ro_dir.join("new").exists());
+        assert!(!ro_dir.join("sub").exists());
+        assert!(!ro_dir.join("moved").exists());
     }
     sb.shutdown(Duration::from_secs(10));
 }

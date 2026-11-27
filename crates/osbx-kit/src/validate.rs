@@ -362,6 +362,20 @@ fn canonical_abs_path(p: &str) -> bool {
         && p.split('/').skip(1).all(|s| s != "." && s != "..")
 }
 
+fn valid_size_string(s: &str) -> bool {
+    let t = s.trim().to_ascii_lowercase();
+    let num = t
+        .strip_suffix("gib")
+        .or_else(|| t.strip_suffix("mib"))
+        .or_else(|| t.strip_suffix("kib"))
+        .or_else(|| t.strip_suffix("gb"))
+        .or_else(|| t.strip_suffix("mb"))
+        .or_else(|| t.strip_suffix("kb"))
+        .or_else(|| t.strip_suffix(['g', 'm', 'k', 'b']))
+        .unwrap_or(&t);
+    !num.is_empty() && num.parse::<u64>().is_ok_and(|n| n > 0)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PhaseLists {
@@ -375,6 +389,37 @@ struct PhaseLists {
 struct NetPolicy1 {
     install: Option<PhaseLists>,
     runtime: Option<PhaseLists>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HttpRuleEntry {
+    hosts: Vec<String>,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    query: std::collections::BTreeMap<String, String>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NetPolicy2Entry {
+    Host(String),
+    Http(HttpRuleEntry),
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PhaseLists2 {
+    #[serde(default)]
+    allow: Vec<NetPolicy2Entry>,
+    #[serde(default)]
+    deny: Vec<NetPolicy2Entry>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetPolicy2 {
+    install: Option<PhaseLists2>,
+    runtime: Option<PhaseLists2>,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -420,6 +465,33 @@ struct MountConfig {
     mode: Option<String>,
     #[allow(dead_code)]
     size: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortConfig {
+    #[allow(dead_code)]
+    name: Option<String>,
+    container: u16,
+    transport: Option<String>,
+    family: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourcesConfig {
+    cpu: Option<f64>,
+    memory: Option<String>,
+    #[allow(dead_code)]
+    gpu: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshAgentConfig {
+    phase: Option<Phases>,
+    unrestricted: Option<bool>,
+    #[serde(default)]
+    sign: Vec<String>,
+    #[serde(default)]
+    authenticate: Vec<String>,
 }
 
 fn short_type(ty: &str) -> Option<&str> {
@@ -541,6 +613,69 @@ fn capabilities(d: &Descriptor, c: &mut Ctx) {
                     ));
                 }
             }
+            "network-policy@2" => {
+                if let Some(np) = decode::<NetPolicy2>(&cap.config, &path, c) {
+                    let mut extract = |phase_name: &str, p: Option<PhaseLists2>| {
+                        let Some(p) = p else {
+                            return (Vec::new(), Vec::new());
+                        };
+                        let mut collect = |list_name: &str, entries: Vec<NetPolicy2Entry>| {
+                            let mut hosts = Vec::new();
+                            for (i, entry) in entries.into_iter().enumerate() {
+                                match entry {
+                                    NetPolicy2Entry::Host(h) => {
+                                        if h.trim().is_empty() {
+                                            c.err(
+                                                format!(
+                                                    "{path}.config.{phase_name}.{list_name}[{i}]"
+                                                ),
+                                                "host must not be empty",
+                                            );
+                                        } else {
+                                            hosts.push(h);
+                                        }
+                                    }
+                                    NetPolicy2Entry::Http(r) => {
+                                        let ep =
+                                            format!("{path}.config.{phase_name}.{list_name}[{i}]");
+                                        if r.hosts.is_empty() {
+                                            c.err(
+                                                format!("{ep}.hosts"),
+                                                "must list at least one host",
+                                            );
+                                        }
+                                        for m in &r.methods {
+                                            if m.is_empty()
+                                                || !m.chars().all(|ch| ch.is_ascii_alphabetic())
+                                            {
+                                                c.err(
+                                                    format!("{ep}.methods"),
+                                                    format!("invalid HTTP method {m:?}"),
+                                                );
+                                            }
+                                        }
+                                        for pth in &r.paths {
+                                            if !pth.starts_with('/') && pth != "*" {
+                                                c.err(
+                                                    format!("{ep}.paths"),
+                                                    format!("path {pth:?} must start with '/'"),
+                                                );
+                                            }
+                                        }
+                                        let _ = &r.query;
+                                        hosts.extend(r.hosts);
+                                    }
+                                }
+                            }
+                            hosts
+                        };
+                        (collect("allow", p.allow), collect("deny", p.deny))
+                    };
+                    let install = extract("install", np.install);
+                    let runtime = extract("runtime", np.runtime);
+                    policy = Some((idx, PolicyLists { install, runtime }));
+                }
+            }
             "credential@1" => {
                 if let Some(cc) = decode::<CredConfig>(&cap.config, &path, c) {
                     let phases = match cc.phase {
@@ -596,6 +731,80 @@ fn capabilities(d: &Descriptor, c: &mut Ctx) {
                         c.err(
                             &path,
                             format!("storage path {} already declared by {prev}", m.path),
+                        );
+                    }
+                }
+            }
+            "port@1" => {
+                if let Some(p) = decode::<PortConfig>(&cap.config, &path, c) {
+                    if p.container == 0 {
+                        c.err(format!("{path}.config.container"), "must be 1..=65535");
+                    }
+                    if let Some(t) = &p.transport
+                        && t != "tcp"
+                        && t != "udp"
+                    {
+                        c.err(
+                            format!("{path}.config.transport"),
+                            format!("unknown transport {t:?} (tcp | udp)"),
+                        );
+                    }
+                    if let Some(f) = &p.family
+                        && !matches!(f.as_str(), "ipv4" | "ipv6" | "dual")
+                    {
+                        c.err(
+                            format!("{path}.config.family"),
+                            format!("unknown family {f:?} (ipv4 | ipv6 | dual)"),
+                        );
+                    }
+                }
+            }
+            "resources@1" => {
+                if let Some(r) = decode::<ResourcesConfig>(&cap.config, &path, c) {
+                    if let Some(cpu) = r.cpu
+                        && (!cpu.is_finite() || cpu < 0.0)
+                    {
+                        c.err(format!("{path}.config.cpu"), "must be a finite number >= 0");
+                    }
+                    if let Some(mem) = &r.memory
+                        && !valid_size_string(mem)
+                    {
+                        c.err(
+                            format!("{path}.config.memory"),
+                            format!("invalid memory size {mem:?}"),
+                        );
+                    }
+                }
+            }
+            "ssh-agent@1" => {
+                if let Some(sa) = decode::<SshAgentConfig>(&cap.config, &path, c) {
+                    if let Some(ph) = sa.phase {
+                        let phases = match ph {
+                            Phases::One(p) => vec![p],
+                            Phases::Many(v) => v,
+                        };
+                        if phases.is_empty() {
+                            c.err(format!("{path}.config.phase"), "must not be empty");
+                        }
+                        for p in &phases {
+                            if p != "install" && p != "runtime" {
+                                c.err(
+                                    format!("{path}.config.phase"),
+                                    format!("unknown phase {p:?}"),
+                                );
+                            }
+                        }
+                        if phases.iter().collect::<BTreeSet<_>>().len() != phases.len() {
+                            c.err(format!("{path}.config.phase"), "phases must be distinct");
+                        }
+                    }
+                    if sa.unrestricted == Some(false)
+                        && sa.sign.is_empty()
+                        && sa.authenticate.is_empty()
+                    {
+                        c.err(
+                            format!("{path}.config"),
+                            "unrestricted: false requires at least one of sign/authenticate",
                         );
                     }
                 }

@@ -228,6 +228,23 @@ impl Record {
     }
 }
 
+/// Path to the credential-binding approvals file (`$OSBX_HOME/secrets/credentials.yaml`).
+pub fn bindings_path() -> PathBuf {
+    home().join("secrets").join("credentials.yaml")
+}
+
+/// Load credential bindings if `credentials.yaml` exists (`Ok(None)` when absent).
+pub fn load_bindings() -> io::Result<Option<osbx_secrets::Bindings>> {
+    let p = bindings_path();
+    match std::fs::read_to_string(&p) {
+        Ok(s) => osbx_secrets::Bindings::from_yaml(&s)
+            .map(Some)
+            .map_err(|e| io::Error::other(format!("{}: {e}", p.display()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Write a file via a temporary sibling and rename.
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");

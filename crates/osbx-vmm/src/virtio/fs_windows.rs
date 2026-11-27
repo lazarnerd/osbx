@@ -20,8 +20,9 @@ pub struct Fs {
 }
 
 impl Fs {
-    /// Export `host_dir` under mount tag `tag`.
-    pub fn new(tag: &str, host_dir: &Path) -> io::Result<Self> {
+    /// Export `host_dir` under mount tag `tag`. When `read_only` is true, every mutating FUSE
+    /// request is rejected on the host with `EROFS`.
+    pub fn new(tag: &str, host_dir: &Path, read_only: bool) -> io::Result<Self> {
         if tag.is_empty() || tag.len() > MAX_TAG {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -32,7 +33,7 @@ impl Fs {
         t[..tag.len()].copy_from_slice(tag.as_bytes());
         Ok(Self {
             tag: t,
-            server: Server::new(host_dir, false)?,
+            server: Server::new(host_dir, read_only)?,
             active: None,
         })
     }

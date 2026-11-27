@@ -1,7 +1,7 @@
 # Status
 
 Plan: `docs/PLAN.md`. Usage: `README.md`. Provenance rules: `docs/PROVENANCE.md`. Guest assets: `guest/README.md`.
-Verify: `OSBX_SPEC_EXAMPLES=<spec checkout>/examples cargo test --workspace --no-fail-fast` (129 tests at last run,
+Verify: `OSBX_SPEC_EXAMPLES=<spec checkout>/examples cargo test --workspace --no-fail-fast` (138 tests at last run,
 including end-to-end tests that boot real sandboxes). Dev host: WSL2 Ubuntu 24.04, Intel i7-1360P, nested KVM.
 
 ## Windows hosts (Windows Hypervisor Platform)
@@ -73,11 +73,17 @@ detached supervisor with a control socket.
 **Kits**: local directories (declaration-only) and OCI images (descriptor read from
 `/usr/share/sandbox/kit/*/kit.yaml`, content layered onto the root filesystem; workload kits become the root
 filesystem). Validation, composition (closed set, conflicts, integrates, one workload, one provider per name),
-capability selection (unsupported required -> refused by name; optional -> skipped and recorded).
-Implemented capability types: `network-policy@1`, `credential@1` (runtime phase, API key + inject rules,
-sentinel in the declared env var), `sbx@1` (agent launched by the host under bash with `BASH_ENV`, as the image's user, `WORKSPACE_DIR`/`SANDBOX_NAME` set), `lifecycle@1` (install once, startup every boot, background, files with
-mode/overwrite, interactive tail), `host-mount@1` (host dir per kit+path, overridable via sbxenv `mounts:`),
-`kvm@1`.
+capability selection (unsupported required -> refused by name; optional -> skipped and recorded), create-phase
+kit args (`--kit-arg [KIT.]NAME=VALUE`, `sbxenv.yaml` `kits[].args`, `Arg.env` delivery, post-expansion re-validation).
+Implemented capability types: `network-policy@1`, `network-policy@2` (Layer-7 HTTP method/path/query rules wired
+into the TLS-intercepting proxy), `credential@1` (runtime phase, API key + inject rules, sentinel in the declared
+env var, OAuth, optional `credentials.yaml` binding enforcement via `osbx secret bind|unbind|bindings`), `sbx@1`
+(agent launched by the host under bash with `BASH_ENV`, as the image's user, `WORKSPACE_DIR`/`SANDBOX_NAME` set),
+`lifecycle@1` (install once, startup every boot, background, files with mode/overwrite, interactive tail),
+`host-mount@1` (host dir per kit+path, overridable via sbxenv `mounts:`), `volume@1` (sandbox-private persistent
+storage surviving stop/start), `port@1` (TCP ports auto-published on loopback at start), `resources@1` (max-reconciled
+CPU/RAM floors), `ssh-agent@1` (host `SSH_AUTH_SOCK` forwarded over vsock with host-side `SSHSIG` namespace
+filtering; fails closed on host-restricted `authenticate`), `kvm@1`, `dockerd@1`, `privileged@1`.
 
 **Docker inside the sandbox** (`--docker` or a kit's `dockerd@1`): the guest loads overlay/bridge/veth/netfilter
 modules and mounts cgroup2; the runtime starts `dockerd` (when the image has it) before startup hooks, with
@@ -99,14 +105,12 @@ parsing; secrets (file store 0600, scopes, command/vault sources with cache).
 - **Docker**: images must contain dockerd (or install it, e.g. `apt-get install docker.io`, then restart); no
   IPv6 for containers; `dockerd@1`'s `autoStart: false` and engine settings from kits are not honored;
   container DNS is not provided (tools reach the network through the proxy settings).
-- **Other capability types**: agent-context, agent-sessions, ssh-agent, port, host-port, volume, resources,
-  docker-auth, git-identity, kit-registry, sbx, usb-device, open-url, long-running, auto-restart, acp,
-  network-policy@2 (HTTP rules exist in the proxy, not wired to kits). Required ones are refused by name.
-- **Kit details**: credential bindings are not enforced; kit args are only defaults (no `--kit-arg`); local kits
-  with a build recipe must be built first; git kit sources unsupported; install-phase credentials unsupported.
+- **Other capability types**: agent-context, agent-sessions, host-port, docker-auth, git-identity,
+  kit-registry, usb-device, open-url, long-running, auto-restart, acp. Required ones are refused by name.
+- **Kit details**: local kits with a build recipe must be built first; git kit sources unsupported;
+  install-phase credentials unsupported; UDP `port@1` and host-restricted `ssh-agent@1` `authenticate` fail closed.
 - **Secrets**: no OS keychain backends (file store only); OAuth `responseFields` mapping and TOML credential files not implemented.
 - **MCP gateway**, **cloud sandboxes**, **organization governance**, templates/snapshots, `sbx move`: not done.
-- **Read-only shares** (clone source) are enforced by guest mount flags, not by the host file server.
 - **Networking**: HTTP/1.1 interception only (no HTTP/2, no WebSocket on intercepted hosts); no UDP.
 - **Guest kernel**: Ubuntu's generic kernel from the archive; a purpose-built minimal kernel would boot faster.
 - **CI**: the workflow has never run; KVM tests need runners with nested virtualization.
@@ -119,4 +123,4 @@ parsing; secrets (file store 0600, scopes, command/vault sources with cache).
 ## Assumptions to confirm against real `sbx` (`grep -rn "ASSUMPTION:" crates/`)
 Wildcard depth (`*` one label), port-less rules cover 80/443, our balanced baseline host list, built-in service
 env/host/header table, version comparison details, sbxenv layering rules, agent-name -> image mapping
-(`docker.io/sbx/<agent>`), read-only share enforcement.
+(`docker.io/sbx/<agent>`).

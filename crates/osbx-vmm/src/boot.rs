@@ -59,6 +59,8 @@ pub struct ShareConfig {
     pub tag: String,
     /// Host directory.
     pub host_dir: PathBuf,
+    /// Refuse every modification on the host FUSE server (`EROFS`), even if guest root remounts rw.
+    pub read_only: bool,
 }
 
 /// What to boot.
@@ -291,7 +293,7 @@ impl Vm {
             add(Box::new(blk), &mut cfg.cmdline)?;
         }
         for share in &cfg.shares {
-            let fs = crate::virtio::fs::Fs::new(&share.tag, &share.host_dir)
+            let fs = crate::virtio::fs::Fs::new(&share.tag, &share.host_dir, share.read_only)
                 .map_err(|e| BootError(format!("share {}: {e}", share.host_dir.display())))?;
             add(Box::new(fs), &mut cfg.cmdline)?;
         }

@@ -10,10 +10,12 @@ compile_error!(
     "osbx-sandbox needs a hypervisor backend; osbx has Linux (KVM) and Windows (WHP) backends"
 );
 
+pub mod ssh_agent;
+
 use osbx_policy::PolicySet;
 use osbx_proto::{
-    AGENT_PORT, EGRESS_PORT, ExecRequest, GUEST_PROXY_ADDR, POWEROFF, TUNNEL_PORT, run_exec,
-    write_frame,
+    AGENT_PORT, EGRESS_PORT, ExecRequest, GUEST_PROXY_ADDR, POWEROFF, SSH_AGENT_PORT, TUNNEL_PORT,
+    run_exec, write_frame,
 };
 use osbx_proxy::{
     Ca, Credentials, DirectUpstream, Event, ProxyConfig, Upstream, web_pki_client_config,
@@ -41,8 +43,7 @@ pub struct Share {
     pub host_dir: PathBuf,
     /// Absolute mount point inside the guest (no whitespace).
     pub guest_path: String,
-    /// Mount read-only. ASSUMPTION/LIMITATION: enforced by the guest kernel's mount flags, not yet
-    /// by the host file server, so guest root could remount it read-write.
+    /// Mount read-only (enforced both by guest mount flags and by the host FUSE server).
     pub read_only: bool,
 }
 
@@ -78,6 +79,8 @@ pub struct SandboxConfig {
     pub client_tls: Option<Arc<rustls_reexport::ClientConfig>>,
     /// Receive every policy decision.
     pub events: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    /// Forward the host SSH agent into the guest (`ssh-agent@1`), if granted.
+    pub ssh_agent: Option<ssh_agent::SshAgentConfig>,
 }
 
 /// Re-exported so callers need not depend on rustls directly.
@@ -160,13 +163,19 @@ impl Sandbox {
             shares.push(osbx_vmm::ShareConfig {
                 tag,
                 host_dir: sh.host_dir.clone(),
+                read_only: sh.read_only,
             });
         }
+        let ssh_arg = if cfg.ssh_agent.is_some() {
+            " osbx.ssh_agent=1"
+        } else {
+            ""
+        };
         let boot = BootConfig {
             kernel: cfg.kernel,
             initrd: Some(cfg.initrd),
             cmdline: format!(
-                "{DEFAULT_CMDLINE} osbx.mode=agent {}{share_args}",
+                "{DEFAULT_CMDLINE} osbx.mode=agent {}{share_args}{ssh_arg}",
                 cfg.extra_cmdline
             ),
             mem_mib: cfg.mem_mib,
@@ -188,6 +197,16 @@ impl Sandbox {
                 bridge_to_proxy(&handle, stream, proxy.clone());
             }
         });
+        if let Some(ssh_cfg) = cfg.ssh_agent {
+            let ssh_rx = vm.vsock().expect("vsock configured").listen(SSH_AGENT_PORT);
+            let ssh_cfg = Arc::new(ssh_cfg);
+            std::thread::spawn(move || {
+                while let Ok(stream) = ssh_rx.recv() {
+                    let c = ssh_cfg.clone();
+                    std::thread::spawn(move || ssh_agent::bridge(stream, &c));
+                }
+            });
+        }
 
         let mut env = cfg.env;
         let proxy_url = format!("http://{GUEST_PROXY_ADDR}");
