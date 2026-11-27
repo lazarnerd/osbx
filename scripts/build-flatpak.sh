@@ -184,7 +184,15 @@ if [ "$INSTALL" = 1 ]; then
     flatpak install --user -y "$REMOTE" "$APP_ID//$BRANCH"
   fi
   if [ "$INSTALL_SHIM" = 1 ]; then
-    "$HERE/install-flatpak.sh" --shim-only --branch "$BRANCH" --bin-dir "$SHIM_DIR"
+    mkdir -p "$SHIM_DIR"
+    SHIM_PATH="${SHIM_DIR%/}/osbx"
+    rm -f "$SHIM_PATH"
+    cat > "$SHIM_PATH" <<EOF
+#!/bin/sh
+exec flatpak run $APP_ID "\$@"
+EOF
+    chmod 0755 "$SHIM_PATH"
+    echo "==> installed wrapper $SHIM_PATH"
   fi
 fi
 
@@ -201,6 +209,6 @@ if [ "$INSTALL" = 1 ]; then
   fi
   echo "  Upgrade later: ./scripts/build-flatpak.sh --install"
 else
-  echo "  Install: ./scripts/install-flatpak.sh $OUT/osbx.flatpak"
+  echo "  Install: flatpak install --user $OUT/osbx.flatpak"
   echo "  Or install & enable 1-command upgrades: ./scripts/build-flatpak.sh --install"
 fi
