@@ -45,7 +45,29 @@ Hardware-isolated KVM &amp; WHP microVMs · Zero-NIC egress proxy · Blind crede
 
 ## Quick Start
 
-### Linux — Flatpak (recommended)
+### Linux — Debian / Ubuntu (`.deb`)
+
+Download the latest `osbx_<version>_amd64.deb` from [GitHub Releases](https://github.com/lazarnerd/osbx/releases) and install it with `apt` (installs `/usr/bin/osbx` and bundled guest assets in `/usr/share/osbx/guest` directly on your `PATH`):
+
+```bash
+sudo apt install ./osbx_<version>_amd64.deb
+
+osbx vmm probe --run-guest                   # verify host KVM (and nested kvm@1) support
+cd ~/my-project
+osbx run shell                               # create + start + attach (workspace = cwd)
+```
+
+<details>
+<summary><strong>Build a local <code>.deb</code> package from source</strong></summary>
+
+```bash
+./guest/build-assets.sh --with-osbx          # once, if guest/assets/ is not yet built
+./scripts/build-deb.sh --install             # builds dist/deb/osbx_<ver>_amd64.deb and installs it
+```
+
+</details>
+
+### Linux — Flatpak
 
 Add the self-hosted OSTree repository (plus Flathub for the `org.freedesktop.Platform` runtime), install `io.github.lazarnerd.osbx`, and symlink the exported launcher to `~/.local/bin/osbx` so you can run `osbx` directly in your terminal:
 
@@ -206,7 +228,7 @@ Sandbox state lives in `$OSBX_HOME` (default `~/.local/share/osbx` on Linux, `%L
 | `crates/` | Rust workspace (see above) |
 | `guest/` | Guest init and `build-assets.sh` (builds kernel, initramfs, and agent into git-ignored `guest/assets/`) |
 | `third_party/vm-memory/` | Patched `vm-memory` (see [`OSBX-PATCH.md`](third_party/vm-memory/OSBX-PATCH.md)) |
-| `scripts/` | Install and packaging scripts (`install-osbx.ps1`, `build-flatpak.sh`) |
+| `scripts/` | Install and packaging scripts (`install-osbx.ps1`, `build-deb.sh`, `build-flatpak.sh`) |
 | `packaging/` | Self-hosted Flatpak AppStream metainfo |
 | `assets/` | Project logo and icon marks (`logo-dark`, `logo-light`, `icon` in SVG and retina PNG) |
 | `docs/` | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`STATUS.md`](docs/STATUS.md), [`PLAN.md`](docs/PLAN.md), [`PROVENANCE.md`](docs/PROVENANCE.md) |

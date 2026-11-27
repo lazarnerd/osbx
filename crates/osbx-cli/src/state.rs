@@ -35,18 +35,28 @@ pub fn home() -> PathBuf {
     PathBuf::from(home).join(".local/share/osbx")
 }
 
-/// Guest kernel/initramfs/agent: `$OSBX_ASSETS`, else `<install dir>/guest` (the `guest`
-/// directory beside the `bin` directory holding this executable, as the installers lay it out),
-/// else `$OSBX_HOME/guest`.
+/// Guest kernel/initramfs/agent: `$OSBX_ASSETS`, else `<install dir>/guest` (beside `bin/`,
+/// as the Windows and Flatpak layouts place it), else `<install dir>/share/osbx/guest`
+/// (FHS layout, e.g. `/usr/share/osbx/guest` for `/usr/bin/osbx`), else `$OSBX_HOME/guest`.
 pub fn assets_dir() -> PathBuf {
     if let Some(a) = std::env::var_os("OSBX_ASSETS") {
         return PathBuf::from(a);
     }
-    let installed = std::env::current_exe()
+    std::env::current_exe()
         .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("guest")))
-        .filter(|g| g.join("vmlinuz").exists());
-    installed.unwrap_or_else(|| home().join("guest"))
+        .and_then(|exe| assets_dir_for_exe(&exe))
+        .unwrap_or_else(|| home().join("guest"))
+}
+
+fn assets_dir_for_exe(exe: &Path) -> Option<PathBuf> {
+    let prefix = exe.parent()?.parent()?;
+    for rel in ["guest", "share/osbx/guest"] {
+        let candidate = prefix.join(rel);
+        if candidate.join("vmlinuz").exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// `p` without Windows' verbatim prefix (`\\?\C:\x` -> `C:\x`, `\\?\UNC\h\s` -> `\\h\s`), as
@@ -376,5 +386,30 @@ mod tests {
             rules: vec![],
         };
         assert!(bad.to_policy().is_err());
+    }
+
+    #[test]
+    fn assets_dir_finds_sibling_and_fhs_layouts() {
+        let root = std::env::temp_dir().join(format!(
+            "osbx-assets-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let exe = root.join("usr/bin/osbx");
+        let fhs = root.join("usr/share/osbx/guest");
+        let sibling = root.join("usr/guest");
+
+        std::fs::create_dir_all(&fhs).unwrap();
+        std::fs::write(fhs.join("vmlinuz"), b"k").unwrap();
+        assert_eq!(assets_dir_for_exe(&exe), Some(fhs.clone()));
+
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("vmlinuz"), b"k").unwrap();
+        assert_eq!(assets_dir_for_exe(&exe), Some(sibling));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
