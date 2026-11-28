@@ -4,8 +4,8 @@ use crate::state::{GuestOs, Record, control_socket};
 pub use crate::sys::is_tty;
 use crate::sys::{LocalStream as UnixStream, RawMode, term_size};
 use osbx_proto::{
-    CHUNK, ERROR, EXEC, EXIT, ExecRequest, RESIZE, STDERR, STDIN, STDIN_EOF, STDOUT, read_frame,
-    resize_payload, write_frame,
+    CHUNK, CP_GET, CP_PUT, CpRequest, ERROR, EXEC, EXIT, ExecRequest, OK, RESIZE, STDERR, STDIN,
+    STDIN_EOF, STDOUT, read_frame, resize_payload, write_frame,
 };
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -180,6 +180,90 @@ fn win_parent_and_base(p: &str) -> (String, String) {
     }
 }
 
+/// Native agent-side copy into a Windows sandbox via `CP_PUT` (zero `tar.exe`/`powershell.exe`).
+/// Returns `Ok(None)` if the guest runs a legacy pre-W3 agent that rejects `CP_PUT`.
+fn cp_put_native(
+    name: &str,
+    path: String,
+    rename: Option<String>,
+    mut input: Box<dyn Read + Send>,
+) -> io::Result<Option<()>> {
+    let mut s = UnixStream::connect(control_socket(name))?;
+    writeln!(s, "{{\"op\":\"cp-put\"}}")?;
+    let req = CpRequest { path, rename };
+    write_frame(
+        &mut s,
+        CP_PUT,
+        &serde_json::to_vec(&req).map_err(io::Error::other)?,
+    )?;
+    let mut writer = s.try_clone()?;
+    let sender = std::thread::spawn(move || -> io::Result<()> {
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            write_frame(&mut writer, STDIN, &buf[..n])?;
+        }
+        write_frame(&mut writer, STDIN_EOF, &[])
+    });
+    let res = match read_frame(&mut s)? {
+        Some((OK, _)) => Ok(Some(())),
+        Some((ERROR, msg)) => {
+            let text = String::from_utf8_lossy(&msg).into_owned();
+            if text.contains("unexpected frame") {
+                Ok(None)
+            } else {
+                Err(io::Error::other(format!(
+                    "copy into sandbox failed: {text}"
+                )))
+            }
+        }
+        other => Err(io::Error::other(format!(
+            "copy into sandbox failed: unexpected reply {other:?}"
+        ))),
+    };
+    drop(sender);
+    res
+}
+
+/// Native agent-side copy out of a Windows sandbox via `CP_GET` (zero `tar.exe`).
+/// Returns `Ok(None)` if the guest runs a legacy pre-W3 agent that rejects `CP_GET`.
+fn cp_get_native(name: &str, path: String) -> io::Result<Option<Vec<u8>>> {
+    let mut s = UnixStream::connect(control_socket(name))?;
+    writeln!(s, "{{\"op\":\"cp-get\"}}")?;
+    let req = CpRequest { path, rename: None };
+    write_frame(
+        &mut s,
+        CP_GET,
+        &serde_json::to_vec(&req).map_err(io::Error::other)?,
+    )?;
+    let mut data = Vec::new();
+    loop {
+        match read_frame(&mut s)? {
+            Some((STDOUT, chunk)) => data.extend_from_slice(&chunk),
+            Some((OK, _)) => return Ok(Some(data)),
+            Some((ERROR, msg)) => {
+                let text = String::from_utf8_lossy(&msg).into_owned();
+                if text.contains("unexpected frame") {
+                    return Ok(None);
+                }
+                return Err(io::Error::other(format!(
+                    "copy out of sandbox failed: {text}"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "agent closed connection during cp-get",
+                ));
+            }
+        }
+    }
+}
+
 /// `osbx cp`: `src` or `dst` (exactly one) is `NAME:/abs/path` (or `NAME:C:\path` for Windows).
 pub fn cp(src: &str, dst: &str) -> io::Result<()> {
     match (parse_sandbox_spec(src), parse_sandbox_spec(dst)) {
@@ -187,15 +271,16 @@ pub fn cp(src: &str, dst: &str) -> io::Result<()> {
             // host -> guest: tar on the host, untar in the guest
             let host = std::path::Path::new(src);
             let (parent, base) = parent_and_base(host)?;
-            let mut tar = std::process::Command::new("tar")
-                .arg("-c")
-                .arg("-C")
-                .arg(parent)
-                .arg(base)
-                .stdout(std::process::Stdio::piped())
-                .spawn()?;
-            let stdout = tar.stdout.take().unwrap();
-            let (code, _, err) = if is_windows_sandbox(&name) {
+            let spawn_host_tar = || -> io::Result<std::process::Child> {
+                std::process::Command::new("tar")
+                    .arg("-c")
+                    .arg("-C")
+                    .arg(parent)
+                    .arg(base)
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+            };
+            if is_windows_sandbox(&name) {
                 let win_guest = normalize_win_guest_path(&guest);
                 let is_dir_dst = guest.ends_with('/') || guest.ends_with('\\');
                 let (target, rename) = if is_dir_dst {
@@ -205,8 +290,21 @@ pub fn cp(src: &str, dst: &str) -> io::Result<()> {
                     (par, leaf)
                 };
                 let base_str = base.to_string_lossy();
+                let rename_opt = (!rename.is_empty() && !rename.eq_ignore_ascii_case(&base_str))
+                    .then(|| rename.clone());
+                let mut tar = spawn_host_tar()?;
+                let stdout = tar.stdout.take().unwrap();
+                let native = cp_put_native(&name, target.clone(), rename_opt, Box::new(stdout));
+                let _ = tar.wait();
+                if native?.is_some() {
+                    return Ok(());
+                }
+                // Fallback for pre-W3 Windows templates that don't handle `CP_PUT`.
+                let mut tar = spawn_host_tar()?;
+                let stdout = tar.stdout.take().unwrap();
                 let ps_esc = |s: &str| s.replace('\'', "''");
-                if rename.is_empty() || rename.eq_ignore_ascii_case(&base_str) {
+                let (code, _, err) = if rename.is_empty() || rename.eq_ignore_ascii_case(&base_str)
+                {
                     let _ = exec_capture(
                         &name,
                         vec![
@@ -286,34 +384,43 @@ pub fn cp(src: &str, dst: &str) -> io::Result<()> {
                             None,
                         )?
                     }
+                };
+                let _ = tar.wait();
+                if code != 0 {
+                    return Err(io::Error::other(format!(
+                        "copy into sandbox failed: {}",
+                        String::from_utf8_lossy(&err).trim()
+                    )));
                 }
+                return Ok(());
+            }
+            let mut tar = spawn_host_tar()?;
+            let stdout = tar.stdout.take().unwrap();
+            let target = if guest.ends_with('/') {
+                guest.clone()
             } else {
-                let target = if guest.ends_with('/') {
-                    guest.clone()
-                } else {
-                    format!("{}/", parent_of(&guest))
-                };
-                let rename = if guest.ends_with('/') {
-                    String::new()
-                } else {
-                    guest.rsplit('/').next().unwrap_or("").to_owned()
-                };
-                let script = if rename.is_empty() || rename == base.to_string_lossy() {
-                    format!("mkdir -p '{target}' && tar -x -C '{target}'")
-                } else {
-                    // copy under a new name: extract to a temp dir, then move
-                    format!(
-                        "t=$(mktemp -d) && tar -x -C \"$t\" && mkdir -p '{target}' && rm -rf '{guest}' && mv \"$t\"/'{}' '{guest}' && rmdir \"$t\"",
-                        base.to_string_lossy()
-                    )
-                };
-                exec_capture(
-                    &name,
-                    vec!["/bin/sh".into(), "-c".into(), script],
-                    None,
-                    Some(Box::new(stdout)),
-                )?
+                format!("{}/", parent_of(&guest))
             };
+            let rename = if guest.ends_with('/') {
+                String::new()
+            } else {
+                guest.rsplit('/').next().unwrap_or("").to_owned()
+            };
+            let script = if rename.is_empty() || rename == base.to_string_lossy() {
+                format!("mkdir -p '{target}' && tar -x -C '{target}'")
+            } else {
+                // copy under a new name: extract to a temp dir, then move
+                format!(
+                    "t=$(mktemp -d) && tar -x -C \"$t\" && mkdir -p '{target}' && rm -rf '{guest}' && mv \"$t\"/'{}' '{guest}' && rmdir \"$t\"",
+                    base.to_string_lossy()
+                )
+            };
+            let (code, _, err) = exec_capture(
+                &name,
+                vec!["/bin/sh".into(), "-c".into(), script],
+                None,
+                Some(Box::new(stdout)),
+            )?;
             let _ = tar.wait();
             if code != 0 {
                 return Err(io::Error::other(format!(
@@ -328,20 +435,24 @@ pub fn cp(src: &str, dst: &str) -> io::Result<()> {
             let (gbase, code, data, err) = if is_windows_sandbox(&name) {
                 let win_guest = normalize_win_guest_path(&guest);
                 let (gparent, gbase) = win_parent_and_base(&win_guest);
-                let (code, data, err) = exec_capture(
-                    &name,
-                    vec![
-                        r"C:\Windows\System32\tar.exe".into(),
-                        "-cf".into(),
-                        "-".into(),
-                        "-C".into(),
-                        gparent,
-                        gbase.clone(),
-                    ],
-                    Some("SYSTEM".into()),
-                    None,
-                )?;
-                (gbase, code, data, err)
+                if let Some(native_tar) = cp_get_native(&name, win_guest)? {
+                    (gbase, 0, native_tar, Vec::new())
+                } else {
+                    let (code, data, err) = exec_capture(
+                        &name,
+                        vec![
+                            r"C:\Windows\System32\tar.exe".into(),
+                            "-cf".into(),
+                            "-".into(),
+                            "-C".into(),
+                            gparent,
+                            gbase.clone(),
+                        ],
+                        Some("SYSTEM".into()),
+                        None,
+                    )?;
+                    (gbase, code, data, err)
+                }
             } else {
                 let (gparent, gbase) = (
                     parent_of(&guest),

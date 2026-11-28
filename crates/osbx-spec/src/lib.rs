@@ -145,11 +145,97 @@ pub enum SkillsMode {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceMode {
-    /// Live bidirectional virtio-fs share.
+    /// Live bidirectional share.
     #[default]
     Direct,
     /// Private git clone inside the sandbox; original repo mounted read-only at `/run/sandbox/source`.
     Clone,
+}
+
+/// Pluggable host-to-guest file-sharing backend for Windows-guest sandboxes (ignored on Linux,
+/// which always uses kernel `virtiofs`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShareBackend {
+    /// Automatically pick the best available backend in the guest
+    /// (`virtiofs-native` -> `winfsp` -> `dokany` -> `projfs` -> `sync`).
+    #[default]
+    Auto,
+    /// Pure-Rust bidirectional sync over `viosock` onto native NTFS (zero guest drivers).
+    Sync,
+    /// Windows inbox Projected File System (`ProjectedFSLib.dll`) over `viosock`.
+    Projfs,
+    /// Live `virtio-fs` (`viofs.sys`) via dynamically loaded LGPL-3.0 `dokan2.dll`.
+    Dokany,
+    /// Live `virtio-fs` (`viofs.sys`) via out-of-process WinFsp `virtiofs.exe`.
+    #[serde(rename = "winfsp")]
+    WinFsp,
+    /// Reserved for a future standalone Apache-2.0 kernel `viofs` IFS driver.
+    VirtiofsNative,
+}
+
+impl ShareBackend {
+    /// Canonical lowercase string representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Sync => "sync",
+            Self::Projfs => "projfs",
+            Self::Dokany => "dokany",
+            Self::WinFsp => "winfsp",
+            Self::VirtiofsNative => "virtiofs-native",
+        }
+    }
+
+    /// True if this backend can use a PCIe `virtio-fs` device.
+    pub const fn uses_virtiofs_pci(self) -> bool {
+        matches!(
+            self,
+            Self::Auto | Self::Dokany | Self::WinFsp | Self::VirtiofsNative
+        )
+    }
+
+    /// True if this backend can use the host `FILE_SYNC_PORT` vsock file RPC service.
+    pub const fn uses_file_sync(self) -> bool {
+        matches!(self, Self::Auto | Self::Sync | Self::Projfs)
+    }
+}
+
+impl std::fmt::Display for ShareBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ShareBackend {
+    type Err = SpecError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "sync" => Ok(Self::Sync),
+            "projfs" => Ok(Self::Projfs),
+            "dokany" | "dokan" => Ok(Self::Dokany),
+            "winfsp" => Ok(Self::WinFsp),
+            "virtiofs-native" | "virtiofs_native" => Ok(Self::VirtiofsNative),
+            other => bad(format!(
+                "invalid share backend {other:?} (expected auto|sync|projfs|dokany|winfsp|virtiofs-native)"
+            )),
+        }
+    }
+}
+
+/// True if `p` is a valid absolute Linux (`/foo`) or Windows (`C:\foo` / `C:/foo`) guest path.
+pub fn is_valid_guest_path(p: &str) -> bool {
+    if p.starts_with('/') {
+        return !p.contains(':');
+    }
+    let b = p.as_bytes();
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && matches!(b[2], b'\\' | b'/')
+        && !p[2..].contains(':')
 }
 
 /// A primary workspace declaration (used by `sbxenv.yaml` and optional single-repo setups).
@@ -163,6 +249,9 @@ pub struct WorkspaceSpec {
     /// Direct live share or private git clone.
     #[serde(default)]
     pub mode: WorkspaceMode,
+    /// Windows file-sharing backend (`auto` by default).
+    #[serde(default)]
+    pub backend: ShareBackend,
 }
 
 /// What kind of mount a [`MountSpec`] represents.
@@ -186,7 +275,7 @@ pub struct MountSpec {
     pub kind: MountKind,
     /// Host path (for `Bind`, `Clone`, `KitMount`) or named volume key (for `Volume`).
     pub source: String,
-    /// Absolute path inside the sandbox guest (must start with `/` and contain no `:`).
+    /// Absolute path inside the sandbox guest (`/abs/path` on Linux or `C:\path` on Windows).
     pub target: String,
     /// Mount read-only inside the guest.
     #[serde(default)]
@@ -197,6 +286,9 @@ pub struct MountSpec {
     /// Optional owning kit handle when [`MountKind::KitMount`] is scoped to a specific kit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit: Option<String>,
+    /// Windows file-sharing backend (`auto` by default).
+    #[serde(default)]
+    pub backend: ShareBackend,
 }
 
 /// Disk sizes in MiB.
@@ -921,7 +1013,7 @@ impl SandboxSpec {
             }
         }
         if let Some(wd) = &self.workdir
-            && !wd.starts_with('/')
+            && !is_valid_guest_path(wd)
         {
             return bad(format!(
                 "sandbox {key:?}: workdir {wd:?} must be an absolute guest path"
@@ -932,10 +1024,10 @@ impl SandboxSpec {
                 return bad(format!("sandbox {key:?}: workspace path must not be blank"));
             }
             if let Some(gp) = &ws.guest_path
-                && (!gp.starts_with('/') || gp.contains(':'))
+                && !is_valid_guest_path(gp)
             {
                 return bad(format!(
-                    "sandbox {key:?}: workspace target {gp:?} must be absolute and contain no ':'"
+                    "sandbox {key:?}: workspace target {gp:?} must be an absolute Unix or Windows path"
                 ));
             }
         }
@@ -946,9 +1038,9 @@ impl SandboxSpec {
                     m.target
                 ));
             }
-            if !m.target.starts_with('/') || m.target.contains(':') {
+            if !is_valid_guest_path(&m.target) {
                 return bad(format!(
-                    "sandbox {key:?}: mount target {:?} must be absolute and contain no ':'",
+                    "sandbox {key:?}: mount target {:?} must be an absolute Unix or Windows path",
                     m.target
                 ));
             }
@@ -961,9 +1053,9 @@ impl SandboxSpec {
         }
         for k in &self.kits {
             for target in k.mounts.keys() {
-                if !target.starts_with('/') || target.contains(':') {
+                if !is_valid_guest_path(target) {
                     return bad(format!(
-                        "sandbox {key:?}: kit {:?} mount target {target:?} must be absolute and contain no ':'",
+                        "sandbox {key:?}: kit {:?} mount target {target:?} must be an absolute Unix or Windows path",
                         k.handle
                     ));
                 }
@@ -1018,7 +1110,7 @@ impl SandboxSpec {
             }
         }
         for f in &self.hooks.guest_files {
-            if !f.path.starts_with('/') {
+            if !is_valid_guest_path(&f.path) {
                 return bad(format!(
                     "sandbox {key:?}: guest file path {:?} must be absolute",
                     f.path
@@ -1101,6 +1193,7 @@ mod tests {
                 read_only: false,
                 mode: None,
                 kit: None,
+                backend: ShareBackend::Auto,
             }],
             env: BTreeMap::new(),
             resources: ResourcesSpec::default(),
@@ -1133,5 +1226,33 @@ mod tests {
             sandboxes: BTreeMap::from([("dev".into(), sb)]),
         };
         assert!(proj.validate().is_ok());
+    }
+
+    #[test]
+    fn share_backend_and_windows_guest_paths() {
+        assert_eq!("auto".parse::<ShareBackend>().unwrap(), ShareBackend::Auto);
+        assert_eq!("sync".parse::<ShareBackend>().unwrap(), ShareBackend::Sync);
+        assert_eq!(
+            "projfs".parse::<ShareBackend>().unwrap(),
+            ShareBackend::Projfs
+        );
+        assert_eq!(
+            "dokany".parse::<ShareBackend>().unwrap(),
+            ShareBackend::Dokany
+        );
+        assert_eq!(
+            "winfsp".parse::<ShareBackend>().unwrap(),
+            ShareBackend::WinFsp
+        );
+        assert_eq!(
+            "virtiofs-native".parse::<ShareBackend>().unwrap(),
+            ShareBackend::VirtiofsNative
+        );
+        assert!(is_valid_guest_path("/workspace"));
+        assert!(is_valid_guest_path(r"C:\workspace"));
+        assert!(is_valid_guest_path("D:/mnt/data"));
+        assert!(!is_valid_guest_path("relative/path"));
+        assert!(!is_valid_guest_path("/bad:colon"));
+        assert!(!is_valid_guest_path(r"C:\bad:colon"));
     }
 }

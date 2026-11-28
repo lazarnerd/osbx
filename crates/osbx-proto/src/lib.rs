@@ -20,6 +20,8 @@ pub const AGENT_PORT: u32 = 1024;
 pub const TUNNEL_PORT: u32 = 1025;
 /// Host vsock port the guest's forwarded SSH agent connections are delivered to.
 pub const SSH_AGENT_PORT: u32 = 1026;
+/// Host vsock port serving host directory RPC + watch events for Windows `sync`/`projfs` shares.
+pub const FILE_SYNC_PORT: u32 = 1027;
 /// Host vsock port the guest's egress is delivered to.
 pub const EGRESS_PORT: u32 = 3128;
 /// Where processes inside a Linux guest find the forwarded SSH agent socket (`ssh-agent@1`).
@@ -48,6 +50,14 @@ pub const SIGNAL: u8 = 0x04;
 pub const POWEROFF: u8 = 0x05;
 /// Host -> agent: terminal size changed (payload: rows u16 LE, cols u16 LE). TTY commands only.
 pub const RESIZE: u8 = 0x06;
+/// Host -> agent: install sandbox CA PEM and configure proxy in-process (payload: UTF-8 PEM).
+pub const SETUP_CA: u8 = 0x07;
+/// Host -> agent: mount a host share inside the guest (payload: JSON [`MountRequest`]).
+pub const MOUNT: u8 = 0x08;
+/// Host -> agent: extract a tar stream into a guest path (payload: JSON [`CpRequest`], followed by `STDIN` frames + `STDIN_EOF`).
+pub const CP_PUT: u8 = 0x09;
+/// Host -> agent: stream a guest path as a tar archive (payload: JSON [`CpRequest`]; replies with `STDOUT` frames + `OK`).
+pub const CP_GET: u8 = 0x0A;
 /// Agent -> host: command stdout bytes.
 pub const STDOUT: u8 = 0x10;
 /// Agent -> host: command stderr bytes.
@@ -56,6 +66,17 @@ pub const STDERR: u8 = 0x11;
 pub const EXIT: u8 = 0x12;
 /// Agent -> host: the request failed (payload: UTF-8 message).
 pub const ERROR: u8 = 0x13;
+/// Agent -> host: control command (`SETUP_CA`, `MOUNT`, `CP_PUT`, `CP_GET`) succeeded (optional UTF-8 payload).
+pub const OK: u8 = 0x14;
+
+/// File-sync vsock RPC request frame (`FILE_SYNC_PORT`, payload: JSON [`FileSyncReq`]).
+pub const FS_REQ: u8 = 0x20;
+/// File-sync vsock RPC response frame (`FILE_SYNC_PORT`, payload: JSON [`FileSyncResp`]).
+pub const FS_RESP: u8 = 0x21;
+/// File-sync raw file data chunk (`FILE_SYNC_PORT`, payload: raw bytes).
+pub const FS_DATA: u8 = 0x22;
+/// File-sync watch event (`FILE_SYNC_PORT`, payload: JSON [`FileSyncEvent`]).
+pub const FS_EVENT: u8 = 0x23;
 
 /// What to run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +104,176 @@ pub struct ExecRequest {
     /// Launch in the interactive desktop session (`winsta0\default`, Windows guests only).
     #[serde(default)]
     pub gui: bool,
+}
+
+/// Request sent in a [`MOUNT`] control frame asking the guest agent to mount one host share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountRequest {
+    /// Share identifier (matching `virtio-fs` tag and `FILE_SYNC_PORT` tag).
+    pub tag: String,
+    /// Guest target path (e.g. `C:\workspace` or `C:\mnt\data`).
+    pub target: String,
+    /// Enforce read-only access inside the guest (host also enforces `EROFS`).
+    #[serde(default)]
+    pub read_only: bool,
+    /// Requested backend (`auto`, `sync`, `projfs`, `dokany`, `winfsp`, `virtiofs-native`).
+    #[serde(default = "default_auto")]
+    pub backend: String,
+}
+
+fn default_auto() -> String {
+    "auto".into()
+}
+
+/// Request sent in a [`CP_PUT`] or [`CP_GET`] control frame for native agent-side file copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpRequest {
+    /// Target directory (for `CP_PUT`) or source file/directory path (for `CP_GET`) in the guest.
+    pub path: String,
+    /// Optional new leaf name when copying a single item under a different name (`CP_PUT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename: Option<String>,
+}
+
+/// Metadata for a single file or directory exposed over [`FILE_SYNC_PORT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// File or directory name (not a full path).
+    pub name: String,
+    /// True if directory, false if regular file.
+    pub is_dir: bool,
+    /// Byte length (0 for directories).
+    pub size: u64,
+    /// Last-modified UNIX timestamp seconds.
+    pub mtime_secs: i64,
+    /// Last-modified sub-second nanoseconds.
+    pub mtime_nanos: u32,
+    /// True if read-only on the host or share.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// RPC request sent by the guest agent to the host over [`FILE_SYNC_PORT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum FileSyncReq {
+    /// List immediate children of `path` (empty string for share root).
+    ListDir {
+        /// Share tag.
+        tag: String,
+        /// Forward-slash relative path inside the share.
+        path: String,
+    },
+    /// Fetch metadata for `path`.
+    Stat {
+        /// Share tag.
+        tag: String,
+        /// Forward-slash relative path inside the share.
+        path: String,
+    },
+    /// Read up to `len` bytes starting at `offset` (response followed by one [`FS_DATA`] frame).
+    ReadFile {
+        /// Share tag.
+        tag: String,
+        /// Forward-slash relative path inside the share.
+        path: String,
+        /// Byte offset.
+        offset: u64,
+        /// Maximum bytes to read.
+        len: u32,
+    },
+    /// Write bytes (supplied in the immediately following [`FS_DATA`] frame) at `offset`.
+    WriteFile {
+        /// Share tag.
+        tag: String,
+        /// Forward-slash relative path inside the share.
+        path: String,
+        /// Byte offset.
+        offset: u64,
+        /// Truncate the file to `offset + data.len()` if true.
+        #[serde(default)]
+        truncate: bool,
+    },
+    /// Create directory (and any missing parents).
+    Mkdir {
+        /// Share tag.
+        tag: String,
+        /// Forward-slash relative path inside the share.
+        path: String,
+    },
+    /// Remove a file or directory.
+    Remove {
+        /// Share tag.
+        tag: String,
+        /// Forward-slash relative path inside the share.
+        path: String,
+        /// Remove directories recursively when true.
+        #[serde(default)]
+        recursive: bool,
+    },
+    /// Rename/move within the same share.
+    Rename {
+        /// Share tag.
+        tag: String,
+        /// Source relative path.
+        from: String,
+        /// Destination relative path.
+        to: String,
+    },
+    /// Subscribe to host-side file change notifications (keeps stream open for [`FS_EVENT`] frames).
+    Watch {
+        /// Share tag.
+        tag: String,
+    },
+}
+
+/// RPC response returned by the host over [`FILE_SYNC_PORT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FileSyncResp {
+    /// Success with no body.
+    Ok,
+    /// Directory listing result.
+    Entries {
+        /// Immediate child entries.
+        entries: Vec<FileEntry>,
+    },
+    /// Metadata result.
+    Meta {
+        /// Entry metadata.
+        entry: FileEntry,
+    },
+    /// Precedes one [`FS_DATA`] frame carrying `len` bytes.
+    Data {
+        /// Exact byte count in the immediately following [`FS_DATA`] frame.
+        len: u32,
+    },
+    /// Path does not exist.
+    NotFound,
+    /// Mutation rejected because share is read-only (`EROFS`).
+    ReadOnly,
+    /// Path invalid or attempted escape outside share root.
+    InvalidPath {
+        /// Reason.
+        message: String,
+    },
+    /// General I/O error.
+    Error {
+        /// Error description.
+        message: String,
+    },
+}
+
+/// Change event streamed by the host to a subscribed [`FileSyncReq::Watch`] guest client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSyncEvent {
+    /// Forward-slash relative path inside the share.
+    pub path: String,
+    /// True if the path was removed; false if created or modified.
+    pub removed: bool,
+    /// True if directory (best-effort; false when removed).
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 /// Encode a [`RESIZE`] payload.

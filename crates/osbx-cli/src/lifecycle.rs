@@ -238,6 +238,8 @@ pub struct CreateOpts {
     pub firewall: Option<osbx_spec::FirewallSpec>,
     /// Attach an emulated CRB vTPM 2.0 device (`0xFED4_0000`, Windows UEFI guests).
     pub vtpm: bool,
+    /// Windows file-sharing backend for the primary workspace (`auto` by default).
+    pub share_backend: osbx_spec::ShareBackend,
 }
 
 fn default_name(agent: &str, ws: Option<&Path>) -> String {
@@ -480,6 +482,7 @@ pub fn create(o: &CreateOpts) -> io::Result<String> {
             } else {
                 WorkspaceMode::Direct
             },
+            backend: o.share_backend,
         }),
         env,
         mem_mib,
@@ -1119,11 +1122,12 @@ fn spec_to_create_opts(
         }
     }
 
-    let (mut ws, mut clone) = match &spec.workspace {
-        None => (None, false),
+    let (mut ws, mut clone, mut ws_backend) = match &spec.workspace {
+        None => (None, false, osbx_spec::ShareBackend::Auto),
         Some(w) => (
             Some(resolve_host_path(base_dir, &w.host_path)),
             w.mode == osbx_spec::WorkspaceMode::Clone,
+            w.backend,
         ),
     };
 
@@ -1154,6 +1158,7 @@ fn spec_to_create_opts(
                     host_dir,
                     guest_path: m.target.clone(),
                     read_only: m.read_only,
+                    backend: m.backend,
                 });
             }
             osbx_spec::MountKind::Volume => {
@@ -1169,6 +1174,7 @@ fn spec_to_create_opts(
                     host_dir,
                     guest_path: m.target.clone(),
                     read_only: m.read_only,
+                    backend: m.backend,
                 });
             }
             osbx_spec::MountKind::Clone => {
@@ -1176,6 +1182,7 @@ fn spec_to_create_opts(
                 if ws.is_none() {
                     ws = Some(host_dir);
                     clone = true;
+                    ws_backend = m.backend;
                 } else {
                     return Err(io::Error::other(format!(
                         "sandbox {key:?}: only one :clone repository per sandbox is currently supported"
@@ -1222,6 +1229,7 @@ fn spec_to_create_opts(
         extra_shares,
         firewall,
         vtpm: false,
+        share_backend: ws_backend,
     };
 
     let name = opts
@@ -1513,6 +1521,7 @@ mod tests {
             workspace: Some(Workspace {
                 host: "/w".into(),
                 mode: WorkspaceMode::Direct,
+                backend: osbx_spec::ShareBackend::Auto,
             }),
             env: BTreeMap::new(),
             mem_mib: 512,

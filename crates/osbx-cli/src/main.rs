@@ -91,6 +91,9 @@ struct CreateArgs {
     /// Attach an emulated CRB vTPM 2.0 device (0xFED40000, Windows UEFI guests)
     #[arg(long)]
     vtpm: bool,
+    /// Windows file-sharing backend for the workspace (auto|sync|projfs|dokany|winfsp|virtiofs-native)
+    #[arg(long, default_value = "auto", value_parser = ["auto", "sync", "projfs", "dokany", "winfsp", "virtiofs-native"])]
+    share_backend: String,
 }
 
 #[derive(Subcommand)]
@@ -275,6 +278,9 @@ enum WindowsCmd {
         /// Path to WinFsp MSI installer (enables in-guest virtio-fs C:\workspace mounts)
         #[arg(long)]
         winfsp: Option<std::path::PathBuf>,
+        /// Path to Dokany 2 MSI installer (enables LGPL-3.0 runtime-loaded virtio-fs mounts)
+        #[arg(long)]
+        dokany: Option<std::path::PathBuf>,
         /// Attach an emulated CRB vTPM 2.0 device during installation (Windows 11)
         #[arg(long)]
         vtpm: bool,
@@ -621,6 +627,10 @@ fn create_opts(a: CreateArgs, agent: String) -> lifecycle::CreateOpts {
         extra_shares: Vec::new(),
         firewall: None,
         vtpm: a.vtpm,
+        share_backend: a
+            .share_backend
+            .parse()
+            .unwrap_or(osbx_spec::ShareBackend::Auto),
     }
 }
 
@@ -773,6 +783,7 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                     firmware_vars,
                     agent_exe,
                     winfsp,
+                    dokany,
                     vtpm,
                     product_key,
                     timeout_mins,
@@ -800,6 +811,7 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                 firmware_vars,
                 agent_exe,
                 winfsp_msi: winfsp,
+                dokany_msi: dokany,
                 vtpm,
                 product_key,
                 timeout_mins,

@@ -10,12 +10,14 @@ compile_error!(
     "osbx-sandbox needs a hypervisor backend; osbx has Linux (KVM) and Windows (WHP) backends"
 );
 
+pub mod file_sync;
 pub mod ssh_agent;
 
 use osbx_policy::PolicySet;
 use osbx_proto::{
-    AGENT_PORT, EGRESS_PORT, ExecRequest, GUEST_PROXY_ADDR, POWEROFF, SSH_AGENT_PORT, TUNNEL_PORT,
-    run_exec, write_frame,
+    AGENT_PORT, EGRESS_PORT, ERROR, ExecRequest, FILE_SYNC_PORT, GUEST_PROXY_ADDR, MOUNT,
+    MountRequest, OK, POWEROFF, SETUP_CA, SSH_AGENT_PORT, TUNNEL_PORT, read_frame, run_exec,
+    write_frame,
 };
 use osbx_proxy::{
     Ca, Credentials, DirectUpstream, Event, ProxyConfig, Upstream, web_pki_client_config,
@@ -120,6 +122,8 @@ pub struct UefiSandboxConfig {
     pub cdroms: Vec<PathBuf>,
     /// Host directories shared over `virtio-fs` PCIe (`tag` derived from `guest_path`).
     pub shares: Vec<osbx_vmm::ShareConfig>,
+    /// Host directories served over `FILE_SYNC_PORT (1027)` for `sync` / `projfs` / `auto` fallback.
+    pub file_sync_shares: Vec<file_sync::FileSyncShare>,
     /// Guest RAM in MiB.
     pub mem_mib: usize,
     /// Number of vCPUs.
@@ -356,6 +360,18 @@ impl Sandbox {
             });
         }
 
+        let closed = Arc::new(AtomicBool::new(false));
+        if !cfg.file_sync_shares.is_empty() {
+            let fs_rx = vm.vsock().expect("vsock configured").listen(FILE_SYNC_PORT);
+            let srv = file_sync::FileSyncServer::new(cfg.file_sync_shares, closed.clone());
+            std::thread::spawn(move || {
+                while let Ok(stream) = fs_rx.recv() {
+                    let s = srv.clone();
+                    std::thread::spawn(move || s.serve(stream));
+                }
+            });
+        }
+
         let mut env = cfg.env;
         let proxy_url = format!("http://{GUEST_PROXY_ADDR}");
         for k in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
@@ -367,9 +383,36 @@ impl Sandbox {
             name: cfg.name,
             vm: VmHandle::Uefi(vm),
             env,
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
             _rt: rt,
         })
+    }
+
+    /// Ask the guest agent to install the sandbox CA PEM and configure proxy in-process (`SETUP_CA`).
+    pub fn setup_ca(&self, ca_pem: &str) -> io::Result<()> {
+        let mut s = self.agent_connection()?;
+        write_frame(&mut s, SETUP_CA, ca_pem.as_bytes())?;
+        match read_frame(&mut s)? {
+            Some((OK, _)) => Ok(()),
+            Some((ERROR, msg)) => Err(io::Error::other(String::from_utf8_lossy(&msg).into_owned())),
+            other => Err(io::Error::other(format!(
+                "unexpected SETUP_CA reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// Ask the guest agent to mount one host share (`MOUNT`) and return the active backend name.
+    pub fn mount_share(&self, req: &MountRequest) -> io::Result<String> {
+        let mut s = self.agent_connection()?;
+        let payload = serde_json::to_vec(req).map_err(io::Error::other)?;
+        write_frame(&mut s, MOUNT, &payload)?;
+        match read_frame(&mut s)? {
+            Some((OK, data)) => Ok(String::from_utf8_lossy(&data).into_owned()),
+            Some((ERROR, msg)) => Err(io::Error::other(String::from_utf8_lossy(&msg).into_owned())),
+            other => Err(io::Error::other(format!(
+                "unexpected MOUNT reply: {other:?}"
+            ))),
+        }
     }
 
     /// The sandbox name.

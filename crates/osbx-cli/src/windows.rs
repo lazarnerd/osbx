@@ -100,6 +100,8 @@ pub struct BuildBaseOpts {
     pub agent_exe: Option<PathBuf>,
     /// Optional path to a WinFsp MSI installer (`winfsp-*.msi`) for in-guest `virtio-fs` mounts.
     pub winfsp_msi: Option<PathBuf>,
+    /// Optional path to a Dokany 2 MSI installer (`Dokan*.msi`) for LGPL-3.0 in-guest `virtio-fs` mounts.
+    pub dokany_msi: Option<PathBuf>,
     /// Attach an emulated CRB vTPM 2.0 device during installation (recommended for Windows 11).
     pub vtpm: bool,
     /// Optional Windows product key (empty by default, skipping the interactive Product Key screen).
@@ -190,6 +192,29 @@ fn find_winfsp_msi(override_path: Option<&Path>) -> Option<PathBuf> {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_ascii_lowercase();
                 if name.starts_with("winfsp") && name.ends_with(".msi") {
+                    return Some(e.path());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_dokany_msi(override_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = override_path {
+        return Some(p.to_path_buf());
+    }
+    if let Some(p) = std::env::var_os("OSBX_DOKANY_MSI") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for dir in [assets_dir(), home().join("guest")] {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                if name.starts_with("dokan") && name.ends_with(".msi") {
                     return Some(e.path());
                 }
             }
@@ -351,11 +376,20 @@ pub fn generate_autounattend_xml(
     )
 }
 
-fn setup_osbx_cmd(profile: WindowsProfile, has_winfsp: bool) -> String {
+fn setup_osbx_cmd(profile: WindowsProfile, has_winfsp: bool, has_dokany: bool) -> String {
     let winfsp_block = if has_winfsp {
         r#"if exist "%SEED%:\winfsp.msi" (
   echo [osbx] installing WinFsp from %SEED%: >> %LOG%
   msiexec /i "%SEED%:\winfsp.msi" /qn /norestart >> %LOG% 2>&1
+)
+"#
+    } else {
+        ""
+    };
+    let dokany_block = if has_dokany {
+        r#"if exist "%SEED%:\dokany.msi" (
+  echo [osbx] installing Dokany from %SEED%: >> %LOG%
+  msiexec /i "%SEED%:\dokany.msi" /qn /norestart >> %LOG% 2>&1
 )
 "#
     } else {
@@ -408,7 +442,9 @@ for %%d in (D E F G) do (
     if exist %%d:\viofs\2k22\amd64\virtiofs.exe copy /Y %%d:\viofs\2k22\amd64\virtiofs.exe "C:\Program Files\osbx\virtiofs.exe" >> %LOG% 2>&1
   )
 )
-{winfsp_block}sc.exe start VirtioSocketWSP >> %LOG% 2>&1
+echo [osbx] enabling Windows Projected File System (Client-ProjFS) >> %LOG%
+dism /online /enable-feature /featurename:Client-ProjFS /all /norestart >> %LOG% 2>&1
+{winfsp_block}{dokany_block}sc.exe start VirtioSocketWSP >> %LOG% 2>&1
 copy /Y "%SEED%:\osbx-agent.exe" "C:\Program Files\osbx\osbx-agent.exe" >> %LOG% 2>&1
 sc.exe create osbx-agent binPath= "\"C:\Program Files\osbx\osbx-agent.exe\"" start= auto depend= VirtioSocketWSP DisplayName= "osbx Guest Agent" >> %LOG% 2>&1
 sc.exe start osbx-agent >> %LOG% 2>&1
@@ -445,6 +481,15 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
             format!("WinFsp MSI not found: {}", msi.display()),
         ));
     }
+    let dokany_msi = find_dokany_msi(o.dokany_msi.as_deref());
+    if let Some(msi) = &dokany_msi
+        && !msi.exists()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Dokany MSI not found: {}", msi.display()),
+        ));
+    }
 
     let image_index = o
         .image_index
@@ -469,7 +514,8 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
         },
         IsoFile {
             name: "setup_osbx.cmd".into(),
-            data: setup_osbx_cmd(o.profile, winfsp_msi.is_some()).into_bytes(),
+            data: setup_osbx_cmd(o.profile, winfsp_msi.is_some(), dokany_msi.is_some())
+                .into_bytes(),
         },
         IsoFile {
             name: "osbx-agent.exe".into(),
@@ -479,6 +525,12 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
     if let Some(msi) = &winfsp_msi {
         seed_files.push(IsoFile {
             name: "winfsp.msi".into(),
+            data: std::fs::read(msi)?,
+        });
+    }
+    if let Some(msi) = &dokany_msi {
+        seed_files.push(IsoFile {
+            name: "dokany.msi".into(),
             data: std::fs::read(msi)?,
         });
     }
@@ -505,7 +557,7 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
     cfg.timeout = Some(Duration::from_secs(o.timeout_mins * 60));
 
     eprintln!(
-        "building Windows template {:?} (profile={}, index={}, {} GiB QCOW2, {} MiB RAM, {} vCPUs{}) ...",
+        "building Windows template {:?} (profile={}, index={}, {} GiB QCOW2, {} MiB RAM, {} vCPUs{}{}) ...",
         o.name,
         o.profile.as_str(),
         image_index,
@@ -514,6 +566,11 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
         o.cpus,
         if winfsp_msi.is_some() {
             ", +WinFsp"
+        } else {
+            ""
+        },
+        if dokany_msi.is_some() {
+            ", +Dokany"
         } else {
             ""
         }
@@ -680,11 +737,13 @@ mod tests {
     }
 
     #[test]
-    fn desktop_setup_script_enables_rdp_and_viofs() {
-        let cmd = setup_osbx_cmd(WindowsProfile::Desktop, true);
+    fn desktop_setup_script_enables_rdp_projfs_and_viofs() {
+        let cmd = setup_osbx_cmd(WindowsProfile::Desktop, true, true);
         assert!(cmd.contains("viofs.inf"));
         assert!(cmd.contains("virtiofs.exe"));
+        assert!(cmd.contains("Client-ProjFS"));
         assert!(cmd.contains("winfsp.msi"));
+        assert!(cmd.contains("dokany.msi"));
         assert!(cmd.contains("fDenyTSConnections"));
         assert!(cmd.contains("AutoAdminLogon"));
     }

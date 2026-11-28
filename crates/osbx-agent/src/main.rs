@@ -5,6 +5,12 @@
 //!   where the policy proxy serves them.
 
 #[cfg(windows)]
+mod win_dokany;
+#[cfg(windows)]
+mod win_projfs;
+#[cfg(windows)]
+mod win_sync;
+#[cfg(windows)]
 mod windows;
 
 #[cfg(not(any(target_os = "linux", windows)))]
