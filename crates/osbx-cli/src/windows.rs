@@ -305,6 +305,12 @@ pub fn generate_autounattend_xml(
     </component>
 {specialize_bypass_nro}  </settings>
   <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <InputLocale>0409:00000409</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
       <OOBE>
         <HideEULAPage>true</HideEULAPage>
@@ -362,6 +368,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-T
 netsh advfirewall firewall set rule group="remote desktop" new enable=Yes >> %LOG% 2>&1
 net localgroup "Remote Desktop Users" agent /add >> %LOG% 2>&1
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f >> %LOG% 2>&1
+reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoLogonCount /f >> %LOG% 2>&1
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d agent /f >> %LOG% 2>&1
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "Osbx-Agent-2025!" /f >> %LOG% 2>&1
 reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization" /v NoLockScreen /t REG_DWORD /d 1 /f >> %LOG% 2>&1
@@ -664,6 +671,7 @@ mod tests {
         assert!(xml_no_tpm.contains("BypassNRO"));
         assert!(xml_no_tpm.contains("<Key></Key>"));
         assert!(xml_no_tpm.contains("viostor\\w11\\amd64"));
+        assert!(xml_no_tpm.contains("Microsoft-Windows-International-Core\""));
 
         let xml_with_tpm = generate_autounattend_xml(WindowsProfile::Win11, 6, true, None);
         assert!(!xml_with_tpm.contains("BypassTPMCheck"));
