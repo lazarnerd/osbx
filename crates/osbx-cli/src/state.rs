@@ -144,6 +144,10 @@ pub enum WorkspaceMode {
     Clone,
 }
 
+fn is_default_backend(b: &osbx_spec::ShareBackend) -> bool {
+    *b == osbx_spec::ShareBackend::Auto
+}
+
 /// A workspace binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
@@ -151,6 +155,9 @@ pub struct Workspace {
     pub host: PathBuf,
     /// Mode.
     pub mode: WorkspaceMode,
+    /// Windows file-sharing backend (`auto` by default).
+    #[serde(default, skip_serializing_if = "is_default_backend")]
+    pub backend: osbx_spec::ShareBackend,
 }
 
 /// An additional host-directory share (bind mount or named volume).
@@ -163,6 +170,9 @@ pub struct StoredShare {
     /// Mount read-only inside the guest.
     #[serde(default)]
     pub read_only: bool,
+    /// Windows file-sharing backend (`auto` by default).
+    #[serde(default, skip_serializing_if = "is_default_backend")]
+    pub backend: osbx_spec::ShareBackend,
 }
 
 /// Launch settings taken from the image config.

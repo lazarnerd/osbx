@@ -187,6 +187,8 @@ struct WorkspaceFull {
     target: Option<String>,
     #[serde(default)]
     mode: osbx_spec::WorkspaceMode,
+    #[serde(default)]
+    backend: osbx_spec::ShareBackend,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +224,8 @@ struct VolumeLong {
     read_only: bool,
     mode: Option<String>,
     kit: Option<String>,
+    #[serde(default)]
+    backend: osbx_spec::ShareBackend,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -991,15 +995,18 @@ fn parse_short_port(raw: &str) -> Result<osbx_spec::PortSpec, ComposeError> {
     })
 }
 
-/// Split a Compose short volume string `SOURCE:TARGET[:FLAGS]`, preserving a Windows drive prefix
-/// like `C:\path` in `SOURCE`.
+/// Split a Compose short volume string `SOURCE:TARGET[:FLAGS]`, preserving Windows drive prefixes
+/// like `C:\path` in both `SOURCE` and `TARGET`.
 fn parse_short_volume(raw: &str) -> Result<osbx_spec::MountSpec, ComposeError> {
-    let bytes = raw.as_bytes();
-    let search_from = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        2
-    } else {
-        0
+    let skip_drive = |s: &str| {
+        let b = s.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            2
+        } else {
+            0
+        }
     };
+    let search_from = skip_drive(raw);
     let Some(first_rel) = raw[search_from..].find(':') else {
         return bad(format!(
             "volume {raw:?}: expected SOURCE:TARGET[:ro|rw|clone]"
@@ -1008,8 +1015,12 @@ fn parse_short_volume(raw: &str) -> Result<osbx_spec::MountSpec, ComposeError> {
     let first = search_from + first_rel;
     let source = &raw[..first];
     let rest = &raw[first + 1..];
-    let (target, flag) = match rest.split_once(':') {
-        Some((t, f)) => (t, Some(f)),
+    let target_skip = skip_drive(rest);
+    let (target, flag) = match rest[target_skip..].find(':') {
+        Some(rel) => {
+            let idx = target_skip + rel;
+            (&rest[..idx], Some(&rest[idx + 1..]))
+        }
         None => (rest, None),
     };
     if source.is_empty() || target.is_empty() {
@@ -1027,37 +1038,38 @@ fn parse_short_volume(raw: &str) -> Result<osbx_spec::MountSpec, ComposeError> {
         || source.contains('\\')
         || (source.len() >= 2 && source.as_bytes()[1] == b':');
 
-    let (kind, read_only) = match flag {
-        None | Some("rw") => (
-            if is_path {
-                osbx_spec::MountKind::Bind
-            } else {
-                osbx_spec::MountKind::Volume
-            },
-            false,
-        ),
-        Some("ro") => (
-            if is_path {
-                osbx_spec::MountKind::Bind
-            } else {
-                osbx_spec::MountKind::Volume
-            },
-            true,
-        ),
-        Some("clone") => {
-            if !is_path {
-                return bad(format!(
-                    "volume {raw:?}: :clone mode requires a host directory path"
-                ));
-            }
-            (osbx_spec::MountKind::Clone, false)
-        }
-        Some(other) => {
-            return bad(format!(
-                "volume {raw:?}: unknown mount option {other:?} (expected rw|ro|clone)"
-            ));
-        }
+    let mut kind = if is_path {
+        osbx_spec::MountKind::Bind
+    } else {
+        osbx_spec::MountKind::Volume
     };
+    let mut read_only = false;
+    let mut backend = osbx_spec::ShareBackend::Auto;
+    if let Some(flags) = flag {
+        for opt in flags.split(',').filter(|s| !s.is_empty()) {
+            match opt {
+                "rw" => read_only = false,
+                "ro" => read_only = true,
+                "clone" => {
+                    if !is_path {
+                        return bad(format!(
+                            "volume {raw:?}: :clone mode requires a host directory path"
+                        ));
+                    }
+                    kind = osbx_spec::MountKind::Clone;
+                }
+                other => {
+                    if let Ok(b) = other.parse::<osbx_spec::ShareBackend>() {
+                        backend = b;
+                    } else {
+                        return bad(format!(
+                            "volume {raw:?}: unknown mount option {other:?} (expected rw|ro|clone|auto|sync|projfs|dokany|winfsp)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     Ok(osbx_spec::MountSpec {
         kind,
@@ -1066,6 +1078,7 @@ fn parse_short_volume(raw: &str) -> Result<osbx_spec::MountSpec, ComposeError> {
         read_only,
         mode: None,
         kit: None,
+        backend,
     })
 }
 
@@ -1371,6 +1384,7 @@ fn lower_file(
                             host_path: p,
                             guest_path: None,
                             mode: osbx_spec::WorkspaceMode::Direct,
+                            backend: osbx_spec::ShareBackend::Auto,
                         }),
                     )
                 }
@@ -1381,6 +1395,7 @@ fn lower_file(
                     host_path: w.path,
                     guest_path: w.target,
                     mode: w.mode,
+                    backend: w.backend,
                 }),
             ),
         };
@@ -1409,6 +1424,7 @@ fn lower_file(
                         read_only: l.read_only,
                         mode: l.mode,
                         kit: l.kit,
+                        backend: l.backend,
                     }
                 }
             };
@@ -2108,6 +2124,47 @@ sandboxes:
         assert_eq!(m.source, r"C:\src\osbx");
         assert_eq!(m.target, "/workspace/osbx");
         assert!(m.read_only);
+
+        let w = parse_short_volume(r"./data:C:\mnt\data:ro,projfs").unwrap();
+        assert_eq!(w.kind, MountKind::Bind);
+        assert_eq!(w.source, "./data");
+        assert_eq!(w.target, r"C:\mnt\data");
+        assert!(w.read_only);
+        assert_eq!(w.backend, osbx_spec::ShareBackend::Projfs);
+    }
+
+    #[test]
+    fn per_volume_windows_backends_compile_and_validate() {
+        let yaml = r#"
+version: "1"
+sandboxes:
+  win11:
+    template: win11
+    workspace:
+      path: .
+      target: 'C:\workspace'
+      backend: sync
+    volumes:
+      - type: bind
+        source: ./models
+        target: 'C:\mnt\models'
+        read_only: true
+        backend: projfs
+      - './scratch:C:\mnt\scratch:rw,dokany'
+"#;
+        let p = compile(&[yaml], &ctx()).unwrap();
+        let sb = &p.sandboxes["win11"];
+        assert_eq!(
+            sb.workspace.as_ref().unwrap().backend,
+            osbx_spec::ShareBackend::Sync
+        );
+        assert_eq!(sb.mounts.len(), 2);
+        assert_eq!(sb.mounts[0].target, r"C:\mnt\models");
+        assert!(sb.mounts[0].read_only);
+        assert_eq!(sb.mounts[0].backend, osbx_spec::ShareBackend::Projfs);
+        assert_eq!(sb.mounts[1].target, r"C:\mnt\scratch");
+        assert!(!sb.mounts[1].read_only);
+        assert_eq!(sb.mounts[1].backend, osbx_spec::ShareBackend::Dokany);
     }
 
     #[test]

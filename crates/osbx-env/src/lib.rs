@@ -703,6 +703,7 @@ impl EnvFile {
                 host_path: p.clone(),
                 guest_path: None,
                 mode: osbx_spec::WorkspaceMode::Direct,
+                backend: osbx_spec::ShareBackend::Auto,
             },
             Workspace::Full { path, clone } => osbx_spec::WorkspaceSpec {
                 host_path: path.clone(),
@@ -712,6 +713,7 @@ impl EnvFile {
                 } else {
                     osbx_spec::WorkspaceMode::Direct
                 },
+                backend: osbx_spec::ShareBackend::Auto,
             },
         });
 
@@ -725,6 +727,7 @@ impl EnvFile {
                 read_only: extra.read_only.unwrap_or(false),
                 mode: None,
                 kit: None,
+                backend: osbx_spec::ShareBackend::Auto,
             });
         }
         for (sandbox_path, host_path) in &self.mounts {
@@ -735,6 +738,7 @@ impl EnvFile {
                 read_only: false,
                 mode: None,
                 kit: None,
+                backend: osbx_spec::ShareBackend::Auto,
             });
         }
 

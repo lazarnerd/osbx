@@ -465,7 +465,7 @@ pub fn supervise(name: &str) -> io::Result<()> {
             }
         });
     }
-    let mut win_mounts: Vec<(String, String)> = Vec::new();
+    let mut win_mounts: Vec<osbx_proto::MountRequest> = Vec::new();
     let sb = match rec.guest_os {
         GuestOs::Linux => {
             // a larger disk size in the record (CLI --disk or sbxenv rootSize) is applied before boot
@@ -511,7 +511,7 @@ pub fn supervise(name: &str) -> io::Result<()> {
             } else {
                 dir.join("root.img")
             };
-            let (win_shares, mounts) = build_windows_shares(&rec, &dir, &shares);
+            let (win_shares, file_sync_shares, mounts) = build_windows_shares(&rec, &dir, &shares)?;
             win_mounts = mounts;
             Sandbox::start_uefi(osbx_sandbox::UefiSandboxConfig {
                 name: name.to_owned(),
@@ -520,6 +520,7 @@ pub fn supervise(name: &str) -> io::Result<()> {
                 disks: vec![osbx_vmm_disk(root_disk)],
                 cdroms: vec![],
                 shares: win_shares,
+                file_sync_shares,
                 mem_mib: rec.mem_mib,
                 cpus: rec.cpus,
                 policy: policy.clone(),
@@ -645,41 +646,62 @@ usermod -aG kvm "$name" 2>/dev/null || adduser "$name" kvm >/dev/null 2>&1 || \
     }
 }
 
-/// Build `virtio-fs` share configs and `(tag, Windows mount path)` pairs for a Windows guest.
+/// Normalize a Windows target path for overlap/coexistence checks.
+fn normalize_win_target_key(p: &str) -> String {
+    p.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Build host-side PCIe `virtio-fs` configs, `FILE_SYNC_PORT` shares, and guest `MOUNT` requests
+/// for a Windows guest, routing each volume to its configured `ShareBackend` and rejecting nested
+/// mount paths.
 fn build_windows_shares(
     rec: &Record,
     sandbox_dir: &std::path::Path,
     all_shares: &[Share],
-) -> (Vec<osbx_vmm::ShareConfig>, Vec<(String, String)>) {
-    let mut configs = Vec::new();
-    let mut mounts = Vec::new();
+) -> io::Result<(
+    Vec<osbx_vmm::ShareConfig>,
+    Vec<osbx_sandbox::file_sync::FileSyncShare>,
+    Vec<osbx_proto::MountRequest>,
+)> {
+    let mut entries: Vec<(
+        String,
+        std::path::PathBuf,
+        String,
+        bool,
+        osbx_spec::ShareBackend,
+    )> = Vec::new();
     let mut ws_host_dirs: Vec<&std::path::Path> = Vec::new();
 
     if let Some(ws) = &rec.workspace {
         match ws.mode {
             WorkspaceMode::Direct => {
-                configs.push(osbx_vmm::ShareConfig {
-                    tag: "workspace".into(),
-                    host_dir: ws.host.clone(),
-                    read_only: false,
-                });
-                mounts.push(("workspace".into(), r"C:\workspace".into()));
+                entries.push((
+                    "workspace".into(),
+                    ws.host.clone(),
+                    r"C:\workspace".into(),
+                    false,
+                    ws.backend,
+                ));
                 ws_host_dirs.push(ws.host.as_path());
             }
             WorkspaceMode::Clone => {
                 let clone_dir = sandbox_dir.join("clone");
-                configs.push(osbx_vmm::ShareConfig {
-                    tag: "workspace".into(),
-                    host_dir: clone_dir,
-                    read_only: false,
-                });
-                mounts.push(("workspace".into(), r"C:\workspace".into()));
-                configs.push(osbx_vmm::ShareConfig {
-                    tag: "source".into(),
-                    host_dir: ws.host.clone(),
-                    read_only: true,
-                });
-                mounts.push(("source".into(), r"C:\mnt\source".into()));
+                entries.push((
+                    "workspace".into(),
+                    clone_dir,
+                    r"C:\workspace".into(),
+                    false,
+                    ws.backend,
+                ));
+                entries.push((
+                    "source".into(),
+                    ws.host.clone(),
+                    r"C:\mnt\source".into(),
+                    true,
+                    ws.backend,
+                ));
                 ws_host_dirs.push(ws.host.as_path());
             }
         }
@@ -719,21 +741,117 @@ fn build_windows_shares(
         } else {
             format!(r"C:\mnt\{sanitized}")
         };
+        let backend = rec
+            .extra_shares
+            .iter()
+            .find(|es| es.guest_path == sh.guest_path)
+            .map_or(osbx_spec::ShareBackend::Auto, |es| es.backend);
         extra_idx += 1;
-        configs.push(osbx_vmm::ShareConfig {
-            tag: tag.clone(),
-            host_dir: sh.host_dir.clone(),
-            read_only: sh.read_only,
-        });
-        mounts.push((tag, win_mount));
+        entries.push((tag, sh.host_dir.clone(), win_mount, sh.read_only, backend));
     }
 
-    (configs, mounts)
+    // Validate non-nested coexistence: reject duplicate or nested Windows mount targets.
+    let norm_targets: Vec<(String, &str)> = entries
+        .iter()
+        .map(|(_, _, target, _, _)| (normalize_win_target_key(target), target.as_str()))
+        .collect();
+    for i in 0..norm_targets.len() {
+        for j in (i + 1)..norm_targets.len() {
+            let (a, a_raw) = &norm_targets[i];
+            let (b, b_raw) = &norm_targets[j];
+            if a == b
+                || a.strip_prefix(b.as_str())
+                    .is_some_and(|rest| rest.starts_with('\\'))
+                || b.strip_prefix(a.as_str())
+                    .is_some_and(|rest| rest.starts_with('\\'))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Windows share mount targets {a_raw:?} and {b_raw:?} overlap or are nested (use sibling mount points)"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut pci_shares = Vec::new();
+    let mut file_sync_shares = Vec::new();
+    let mut mounts = Vec::new();
+    for (tag, host_dir, target, read_only, backend) in entries {
+        if backend.uses_virtiofs_pci() {
+            pci_shares.push(osbx_vmm::ShareConfig {
+                tag: tag.clone(),
+                host_dir: host_dir.clone(),
+                read_only,
+            });
+        }
+        if backend.uses_file_sync() {
+            file_sync_shares.push(osbx_sandbox::file_sync::FileSyncShare {
+                tag: tag.clone(),
+                host_dir,
+                read_only,
+            });
+        }
+        mounts.push(osbx_proto::MountRequest {
+            tag,
+            target,
+            read_only,
+            backend: backend.as_str().into(),
+        });
+    }
+
+    Ok((pci_shares, file_sync_shares, mounts))
 }
 
-/// Windows guest first-boot setup: push the per-sandbox CA PEM, invoke `osbx-agent.exe
-/// --install-ca`, and mount any configured `virtio-fs` shares via `virtiofs.exe` (WinFsp).
-fn first_boot_setup_windows(sb: &Sandbox, ca_pem: &str, mounts: &[(String, String)]) {
+/// Windows guest first-boot setup: push the per-sandbox CA PEM via native `SETUP_CA` and mount
+/// every configured host share via native `MOUNT` (zero `powershell.exe` / WMI / `netsh.exe`).
+/// Falls back gracefully to the Phase W2 PowerShell path only if talking to a pre-W3 guest agent.
+fn first_boot_setup_windows(sb: &Sandbox, ca_pem: &str, mounts: &[osbx_proto::MountRequest]) {
+    let mut legacy_agent = false;
+    match sb.setup_ca(ca_pem) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("unexpected frame") => {
+            legacy_agent = true;
+            legacy_windows_setup_ca(sb, ca_pem);
+        }
+        Err(e) => eprintln!("windows first-boot CA setup failed: {e}"),
+    }
+
+    if mounts.is_empty() {
+        return;
+    }
+    if legacy_agent {
+        legacy_windows_mount_shares(sb, mounts);
+        return;
+    }
+    for (idx, m) in mounts.iter().enumerate() {
+        match sb.mount_share(m) {
+            Ok(active_backend) => {
+                eprintln!(
+                    "windows mount {} -> {} ({}{})",
+                    m.tag,
+                    m.target,
+                    active_backend,
+                    if m.read_only { ", ro" } else { "" }
+                );
+            }
+            Err(e) if e.to_string().contains("unexpected frame") => {
+                legacy_windows_mount_shares(sb, &mounts[idx..]);
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "windows mount {} -> {} ({}) failed: {e}",
+                    m.tag, m.target, m.backend
+                );
+            }
+        }
+    }
+}
+
+/// Legacy Phase W2 fallback for older Windows templates that do not handle `SETUP_CA`.
+fn legacy_windows_setup_ca(sb: &Sandbox, ca_pem: &str) {
     let ps = r#"New-Item -ItemType Directory -Force -Path 'C:\ProgramData\osbx' | Out-Null; [Console]::In.ReadToEnd() | Set-Content -NoNewline -Encoding Ascii 'C:\ProgramData\osbx\ca.pem'; & 'C:\Program Files\osbx\osbx-agent.exe' --install-ca 'C:\ProgramData\osbx\ca.pem'"#;
     let req = ExecRequest {
         argv: vec![
@@ -754,23 +872,20 @@ fn first_boot_setup_windows(sb: &Sandbox, ca_pem: &str, mounts: &[(String, Strin
         ),
         Err(e) => eprintln!("windows first-boot CA setup failed: {e}"),
     }
+}
 
-    if mounts.is_empty() {
-        return;
-    }
+/// Legacy Phase W2 fallback for older Windows templates that do not handle `MOUNT`.
+fn legacy_windows_mount_shares(sb: &Sandbox, mounts: &[osbx_proto::MountRequest]) {
     let mut mount_ps = String::from(
         "$vfs = 'C:\\Program Files\\osbx\\virtiofs.exe'; if (-not (Test-Path $vfs)) { exit 0 }; ",
     );
-    for (tag, mount_point) in mounts {
-        let tag_esc = tag.replace('\'', "''");
-        let mp_esc = mount_point.replace('\'', "''");
-        // Spawn via WMI Win32_Process.Create so `virtiofs.exe` runs outside the per-exec
-        // KILL_ON_JOB_CLOSE Job Object and remains mounted for the lifetime of the sandbox.
+    for m in mounts {
+        let tag_esc = m.tag.replace('\'', "''");
+        let mp_esc = m.target.replace('\'', "''");
         mount_ps.push_str(&format!(
             "$mp = '{mp_esc}'; $par = Split-Path -Parent $mp; if ($par -and -not (Test-Path $par)) {{ New-Item -ItemType Directory -Force -Path $par | Out-Null }}; if (Test-Path $mp) {{ try {{ Remove-Item $mp -Force -ErrorAction Stop }} catch {{}} }}; $cmd = '\"' + $vfs + '\" -t {tag_esc} -m \"' + $mp + '\"'; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = $cmd }} | Out-Null; "
         ));
     }
-    // Give virtiofs.exe + WinFsp a moment to register the mount points.
     mount_ps.push_str("Start-Sleep -Milliseconds 2000");
     let mreq = ExecRequest {
         argv: vec![
@@ -1137,8 +1252,34 @@ fn handle(mut conn: UnixStream, st: &State, sock: &std::path::Path, dir: &std::p
             std::process::exit(0);
         }
         "exec" => relay_exec(conn, st),
+        "cp-put" | "cp-get" => relay_raw_agent(conn, st),
         other => reply(&mut conn, json!({"error": format!("unknown op {other:?}")})),
     }
+}
+
+/// Splice a client's raw `osbx-proto` frames (`CP_PUT`, `CP_GET`) directly to the guest agent.
+fn relay_raw_agent(mut client: UnixStream, st: &State) {
+    let mut agent = match st.sb.agent_connection() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = write_frame(
+                &mut client,
+                osbx_proto::ERROR,
+                format!("guest agent unreachable: {e}").as_bytes(),
+            );
+            return;
+        }
+    };
+    let (Ok(mut client_r), mut agent_r) = (client.try_clone(), agent.try_clone()) else {
+        return;
+    };
+    let up = std::thread::spawn(move || {
+        let _ = io::copy(&mut client_r, &mut agent);
+        agent.shutdown_write();
+    });
+    let _ = io::copy(&mut agent_r, &mut client);
+    let _ = client.shutdown(std::net::Shutdown::Both);
+    let _ = up.join();
 }
 
 /// Fill in the sandbox environment, then splice the client to the guest agent until it closes.

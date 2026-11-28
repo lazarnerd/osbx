@@ -29,6 +29,14 @@ can confirm or correct it. `grep -rn "ASSUMPTION:" crates/` lists them all.
   inside the Windows guest during template build to back `virtiofs.exe` (`viofs.sys`). WinFsp is
   licensed under GPLv3 with the FLOSS License Exception (compatible with Apache-2.0). `osbx` does
   not link against, embed, or redistribute WinFsp; it only invokes the user-supplied installer
-  inside the guest VM.
+  inside the guest VM and launches `virtiofs.exe` out-of-process.
+- **Dokany 2 (`dokan2.dll`):** Optional user-supplied MSI (`--dokany <msi>`) installed inside the
+  Windows guest during template build for LGPL-3.0 `virtio-fs` mounts (`backend: dokany`). `osbx`
+  does not link against, embed, or redistribute Dokany; `osbx-agent.exe` dynamically loads
+  `dokan2.dll` at runtime via `LoadLibraryW`/`GetProcAddress` only when installed in the guest.
+- **Windows Projected File System (`ProjectedFSLib.dll` / `Client-ProjFS`):** Built-in Windows
+  optional OS component enabled via `dism` during template build and dynamically loaded at runtime
+  via `LoadLibraryW`/`GetProcAddress` for `backend: projfs` mounts. No third-party driver is
+  bundled or redistributed.
 - **EDK2 OVMF firmware (`OVMF_CODE_4M.fd`, `OVMF_VARS_4M.fd`):** Loaded at runtime from the host
   system or `$OSBX_HOME/guest`; licensed under BSD-2-Clause-Patent.

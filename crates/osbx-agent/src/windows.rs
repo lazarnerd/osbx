@@ -15,29 +15,43 @@
 
 #![allow(unsafe_code)]
 
+use crate::{win_dokany, win_projfs, win_sync};
 use osbx_proto::{
-    AGENT_PORT, CHUNK, EGRESS_PORT, ERROR, EXEC, EXIT, ExecRequest, GUEST_PROXY_ADDR,
-    GUEST_WINDOWS_SSH_AGENT_PIPE, POWEROFF, RESIZE, SIGNAL, SSH_AGENT_PORT, STDERR, STDIN,
-    STDIN_EOF, STDOUT, TUNNEL_PORT, read_frame, write_frame,
+    AGENT_PORT, CHUNK, CP_GET, CP_PUT, CpRequest, EGRESS_PORT, ERROR, EXEC, EXIT, ExecRequest,
+    GUEST_PROXY_ADDR, GUEST_WINDOWS_SSH_AGENT_PIPE, MOUNT, MountRequest, OK, POWEROFF, RESIZE,
+    SETUP_CA, SIGNAL, SSH_AGENT_PORT, STDERR, STDIN, STDIN_EOF, STDOUT, TUNNEL_PORT, read_frame,
+    write_frame,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Command;
 use std::ptr::{null, null_mut};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_PIPE_CONNECTED, GetLastError,
     HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LUID, LocalFree, SetHandleInformation,
 };
+use windows_sys::Win32::NetworkManagement::NetManagement::{
+    LOCALGROUP_MEMBERS_INFO_3, NERR_Success, NetApiBufferFree, NetLocalGroupAddMembers, NetUserAdd,
+    NetUserGetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
+};
+use windows_sys::Win32::Networking::WinHttp::{
+    WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_PROXY_INFO, WinHttpSetDefaultProxyConfiguration,
+};
 use windows_sys::Win32::Networking::WinSock::{
     INVALID_SOCKET, SD_SEND, SOCK_STREAM, SOCKET, SOCKET_ERROR, WSADATA, WSAStartup, accept, bind,
     closesocket, connect, listen, recv, send, shutdown, socket,
+};
+use windows_sys::Win32::Security::Authentication::Identity::{
+    LSA_STRING, LSA_UNICODE_STRING, LsaConnectUntrusted, LsaDeregisterLogonProcess,
+    LsaFreeReturnBuffer, LsaLogonUser, LsaLookupAuthenticationPackage, MSV1_0_S4U_LOGON,
+    MsV1_0S4ULogon, SECURITY_LOGON_TYPE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -47,10 +61,10 @@ use windows_sys::Win32::Security::Cryptography::{
     CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, X509_ASN_ENCODING,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, DuplicateTokenEx, LOGON32_LOGON_BATCH, LOGON32_LOGON_INTERACTIVE,
-    LOGON32_PROVIDER_DEFAULT, LUID_AND_ATTRIBUTES, LogonUserW, LookupPrivilegeValueW,
-    PSECURITY_DESCRIPTOR, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, SecurityImpersonation,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrimary,
+    AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    PSECURITY_DESCRIPTOR, QUOTA_LIMITS, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
+    SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, TOKEN_SOURCE, TokenPrimary,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -70,8 +84,8 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_SZ, RegCloseKey,
-    RegCreateKeyExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegSetValueExW,
 };
 use windows_sys::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW, WTSFreeMemory,
@@ -94,7 +108,7 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
-const HOST_CID: u32 = 2;
+pub(crate) const HOST_CID: u32 = 2;
 const VMADDR_CID_ANY: u32 = u32::MAX;
 /// Red Hat `viosock.sys` IOCTL to query the dynamic `AF_VSOCK` address family:
 /// `CTL_CODE(FILE_DEVICE_UNKNOWN (0x22), 0x800, METHOD_BUFFERED (0), FILE_ANY_ACCESS (0))`.
@@ -102,8 +116,8 @@ const IOCTL_VIOSOCK_GET_AF: u32 = 0x0022_2000;
 const FALLBACK_AF_VSOCK: u16 = 40;
 /// Maximum single SSH agent protocol message (256 KiB, matching OpenSSH `MAX_MSG_LEN`).
 const MAX_SSH_AGENT_MSG: usize = 256 * 1024;
-const AGENT_PASSWORD: &str = "Osbx-Agent-2025!";
-const ADMIN_PASSWORD: &str = "Osbx-Admin-2025!";
+/// Windows `STILL_ACTIVE` sentinel from `GetExitCodeProcess`.
+const STILL_ACTIVE: u32 = 259;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -117,9 +131,26 @@ struct SockAddrVm {
 
 static SERVICE_STATUS_H: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static AF_VSOCK_CACHE: OnceLock<u16> = OnceLock::new();
+static CP_TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn wide(s: &str) -> Vec<u16> {
+enum ActiveMountGuard {
+    WinFsp(#[allow(dead_code)] OwnedHandle),
+    Thread(#[allow(dead_code)] Arc<AtomicBool>),
+}
+
+struct ActiveMount {
+    backend: String,
+    _guard: ActiveMountGuard,
+}
+
+static MOUNTS: LazyLock<Mutex<HashMap<String, ActiveMount>>> = LazyLock::new(Mutex::default);
+
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+pub(crate) fn win_err_to_io(ctx: &str, hr: i32) -> io::Error {
+    io::Error::other(format!("{ctx}: 0x{:08x}", hr as u32))
 }
 
 pub fn run() {
@@ -213,6 +244,7 @@ fn report_service_state(handle: SERVICE_STATUS_HANDLE, state: u32, exit_code: u3
 
 fn run_agent_loop() {
     init_winsock();
+    ensure_local_agent_user();
     // Wait until `viosock.sys` is ready during early Windows boot.
     let af = wait_for_viosock();
     eprintln!("osbx-agent (windows): ready (AF_VSOCK={af})");
@@ -294,7 +326,7 @@ fn wait_for_viosock() -> u16 {
 
 /// Ref-counted Windows WinSock vsock stream supporting full-duplex concurrent Read + Write.
 #[derive(Clone)]
-struct VsockConn(Arc<SocketGuard>);
+pub(crate) struct VsockConn(Arc<SocketGuard>);
 
 struct SocketGuard(SOCKET);
 
@@ -378,7 +410,7 @@ fn vsock_listen(af: u16, port: u32) -> io::Result<SocketGuard> {
     Ok(guard)
 }
 
-fn vsock_connect(af: u16, cid: u32, port: u32) -> io::Result<VsockConn> {
+pub(crate) fn vsock_connect(af: u16, cid: u32, port: u32) -> io::Result<VsockConn> {
     // SAFETY: WinSock stream socket creation.
     let s = unsafe { socket(i32::from(af), SOCK_STREAM, 0) };
     if s == INVALID_SOCKET {
@@ -611,6 +643,78 @@ fn handle_control(mut conn: VsockConn) {
         POWEROFF => {
             trigger_poweroff();
         }
+        SETUP_CA => match handle_setup_ca(&frame.1) {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, OK, &[]);
+            }
+            Err(e) => {
+                let _ = write_frame(&mut conn, ERROR, format!("setup-ca failed: {e}").as_bytes());
+            }
+        },
+        MOUNT => {
+            let req: MountRequest = match serde_json::from_slice(&frame.1) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = write_frame(
+                        &mut conn,
+                        ERROR,
+                        format!("bad mount request: {e}").as_bytes(),
+                    );
+                    return;
+                }
+            };
+            let af = wait_for_viosock();
+            match handle_mount(af, req) {
+                Ok(backend) => {
+                    let _ = write_frame(&mut conn, OK, backend.as_bytes());
+                }
+                Err(e) => {
+                    let _ = write_frame(&mut conn, ERROR, format!("{e}").as_bytes());
+                }
+            }
+        }
+        CP_PUT => {
+            let req: CpRequest = match serde_json::from_slice(&frame.1) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = write_frame(
+                        &mut conn,
+                        ERROR,
+                        format!("bad cp-put request: {e}").as_bytes(),
+                    );
+                    return;
+                }
+            };
+            match handle_cp_put(&mut conn, &req) {
+                Ok(()) => {
+                    let _ = write_frame(&mut conn, OK, &[]);
+                }
+                Err(e) => {
+                    let _ = write_frame(&mut conn, ERROR, format!("{e}").as_bytes());
+                }
+            }
+        }
+        CP_GET => {
+            let req: CpRequest = match serde_json::from_slice(&frame.1) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = write_frame(
+                        &mut conn,
+                        ERROR,
+                        format!("bad cp-get request: {e}").as_bytes(),
+                    );
+                    return;
+                }
+            };
+            match handle_cp_get(&mut conn, &req) {
+                Ok(()) => {
+                    let _ = write_frame(&mut conn, OK, &[]);
+                }
+                Err(e) => {
+                    let _ = write_frame(&mut conn, ERROR, format!("{e}").as_bytes());
+                }
+            }
+        }
         EXEC => {
             let req: ExecRequest = match serde_json::from_slice(&frame.1) {
                 Ok(r) => r,
@@ -648,6 +752,354 @@ fn handle_control(mut conn: VsockConn) {
             );
         }
     }
+}
+
+fn handle_setup_ca(pem_bytes: &[u8]) -> io::Result<()> {
+    let dir = Path::new(r"C:\ProgramData\osbx");
+    std::fs::create_dir_all(dir)?;
+    let pem_path = r"C:\ProgramData\osbx\ca.pem";
+    std::fs::write(pem_path, pem_bytes)?;
+    install_ca_and_proxy(pem_path)
+}
+
+fn service_exists(subkey: &str) -> bool {
+    let sub = wide(subkey);
+    let mut hkey: HKEY = null_mut();
+    // SAFETY: probes whether a Windows service key exists under HKLM.
+    let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut hkey) };
+    if rc == 0 {
+        // SAFETY: closes opened registry key.
+        unsafe {
+            RegCloseKey(hkey);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn is_winfsp_available() -> bool {
+    Path::new(r"C:\Program Files\osbx\virtiofs.exe").is_file()
+        && service_exists(r"SYSTEM\CurrentControlSet\Services\WinFsp.Launcher")
+}
+
+/// Spawn `virtiofs.exe` directly from the `osbx-agent` service (outside any per-exec
+/// `KILL_ON_JOB_CLOSE` Job Object) and wait until `target` serves directory reads.
+/// Retries across early-boot races when `viofs.sys` or `WinFsp` is still initializing.
+fn mount_winfsp(tag: &str, target: &str) -> io::Result<OwnedHandle> {
+    let exe = r"C:\Program Files\osbx\virtiofs.exe";
+    if !Path::new(exe).is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "virtiofs.exe not installed at C:\\Program Files\\osbx\\virtiofs.exe",
+        ));
+    }
+    let mp = Path::new(target);
+    if let Some(parent) = mp.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut last_err = io::Error::other(format!(
+        "virtiofs.exe failed to mount {tag:?} at {target:?}"
+    ));
+    for attempt in 0..4 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_secs(2));
+        }
+        if mp.exists() || mp.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_dir(mp);
+        }
+        let mut cmd = wide(&build_cmdline(&[
+            exe.to_owned(),
+            "-t".to_owned(),
+            tag.to_owned(),
+            "-m".to_owned(),
+            target.to_owned(),
+        ]));
+        // SAFETY: zeroed `STARTUPINFOW` and `PROCESS_INFORMATION` are plain old data.
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        // SAFETY: plain old data filled by `CreateProcessW`.
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: spawns `virtiofs.exe` directly under LocalSystem without a Job Object so it
+        // lives for the lifetime of the sandbox.
+        let ok = unsafe {
+            CreateProcessW(
+                null(),
+                cmd.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                CREATE_NO_WINDOW,
+                null(),
+                null(),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            last_err = io::Error::last_os_error();
+            continue;
+        }
+        let proc_h = OwnedHandle(pi.hProcess);
+        let _thread_h = OwnedHandle(pi.hThread);
+
+        let mut exited_early = None;
+        for _ in 0..150 {
+            if std::fs::read_dir(mp).is_ok() {
+                return Ok(proc_h);
+            }
+            let mut code: u32 = 0;
+            // SAFETY: checks whether `virtiofs.exe` exited early while drivers were starting.
+            if unsafe { GetExitCodeProcess(proc_h.0, &mut code) } != 0 && code != STILL_ACTIVE {
+                exited_early = Some(code);
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(code) = exited_early {
+            last_err = io::Error::other(format!(
+                "virtiofs.exe exited early with code {code} while mounting tag {tag:?} at {target:?}"
+            ));
+        } else {
+            // SAFETY: terminates timed-out `virtiofs.exe` before retrying.
+            unsafe {
+                TerminateProcess(proc_h.0, 1);
+            }
+            last_err = io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("virtiofs.exe did not expose {target:?} within 15s"),
+            );
+        }
+    }
+    Err(last_err)
+}
+
+fn handle_mount(af: u16, req: MountRequest) -> io::Result<String> {
+    {
+        let mounts = MOUNTS.lock().unwrap();
+        if let Some(existing) = mounts.get(&req.tag) {
+            return Ok(existing.backend.clone());
+        }
+    }
+    let (active_backend, guard) = match req.backend.as_str() {
+        "virtiofs-native" => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "virtiofs-native kernel driver not installed in guest",
+            ));
+        }
+        "winfsp" => (
+            "winfsp".to_owned(),
+            ActiveMountGuard::WinFsp(mount_winfsp(&req.tag, &req.target)?),
+        ),
+        "dokany" => (
+            "dokany".to_owned(),
+            ActiveMountGuard::Thread(win_dokany::start_dokany_mount(
+                req.tag.clone(),
+                req.target.clone(),
+                req.read_only,
+            )?),
+        ),
+        "projfs" => (
+            "projfs".to_owned(),
+            ActiveMountGuard::Thread(win_projfs::start_projfs_mount(
+                af,
+                req.tag.clone(),
+                req.target.clone(),
+                req.read_only,
+            )?),
+        ),
+        "sync" => (
+            "sync".to_owned(),
+            ActiveMountGuard::Thread(win_sync::start_sync_mount(
+                af,
+                req.tag.clone(),
+                req.target.clone(),
+                req.read_only,
+            )?),
+        ),
+        "auto" => {
+            let mut chosen: Option<(String, ActiveMountGuard)> = None;
+            if is_winfsp_available()
+                && let Ok(h) = mount_winfsp(&req.tag, &req.target)
+            {
+                chosen = Some(("winfsp".to_owned(), ActiveMountGuard::WinFsp(h)));
+            }
+            if chosen.is_none()
+                && win_dokany::is_dokany_available()
+                && let Ok(stop) = win_dokany::start_dokany_mount(
+                    req.tag.clone(),
+                    req.target.clone(),
+                    req.read_only,
+                )
+            {
+                chosen = Some(("dokany".to_owned(), ActiveMountGuard::Thread(stop)));
+            }
+            if chosen.is_none()
+                && win_projfs::is_projfs_available()
+                && let Ok(stop) = win_projfs::start_projfs_mount(
+                    af,
+                    req.tag.clone(),
+                    req.target.clone(),
+                    req.read_only,
+                )
+            {
+                chosen = Some(("projfs".to_owned(), ActiveMountGuard::Thread(stop)));
+            }
+            if let Some(c) = chosen {
+                c
+            } else {
+                let stop = win_sync::start_sync_mount(
+                    af,
+                    req.tag.clone(),
+                    req.target.clone(),
+                    req.read_only,
+                )?;
+                ("sync".to_owned(), ActiveMountGuard::Thread(stop))
+            }
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown share backend {other:?}"),
+            ));
+        }
+    };
+
+    MOUNTS.lock().unwrap().insert(
+        req.tag,
+        ActiveMount {
+            backend: active_backend.clone(),
+            _guard: guard,
+        },
+    );
+    Ok(active_backend)
+}
+
+/// Streams incoming `STDIN` frames (until `STDIN_EOF`) as an `io::Read` for `tar::Archive`.
+struct FrameReader<'a> {
+    conn: &'a mut VsockConn,
+    buf: Vec<u8>,
+    pos: usize,
+    eof: bool,
+}
+
+impl Read for FrameReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.pos < self.buf.len() {
+                let n = (self.buf.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            if self.eof {
+                return Ok(0);
+            }
+            match read_frame(self.conn)? {
+                Some((STDIN, data)) => {
+                    self.buf = data;
+                    self.pos = 0;
+                }
+                Some((STDIN_EOF, _)) | None => {
+                    self.eof = true;
+                    return Ok(0);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Writes `tar::Builder` bytes out as `STDOUT` frames in `CHUNK`-sized slices.
+struct FrameWriter<'a> {
+    conn: &'a mut VsockConn,
+    pending: Vec<u8>,
+}
+
+impl Write for FrameWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        while self.pending.len() >= CHUNK {
+            let chunk: Vec<u8> = self.pending.drain(..CHUNK).collect();
+            write_frame(self.conn, STDOUT, &chunk)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            write_frame(self.conn, STDOUT, &tail)?;
+        }
+        Ok(())
+    }
+}
+
+fn handle_cp_put(conn: &mut VsockConn, req: &CpRequest) -> io::Result<()> {
+    let reader = FrameReader {
+        conn,
+        buf: Vec::new(),
+        pos: 0,
+        eof: false,
+    };
+    let mut archive = tar::Archive::new(reader);
+    let target = Path::new(&req.path);
+    std::fs::create_dir_all(target)?;
+
+    if let Some(new_name) = req.rename.as_deref().filter(|s| !s.is_empty()) {
+        let seq = CP_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("osbx-cp-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&tmp)?;
+        let unpack_res = archive.unpack(&tmp);
+        if let Err(e) = unpack_res {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&tmp)?
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .collect();
+        let src_item = entries.pop().ok_or_else(|| {
+            let _ = std::fs::remove_dir_all(&tmp);
+            io::Error::new(io::ErrorKind::InvalidData, "empty tar archive in cp-put")
+        })?;
+        let dst = target.join(new_name);
+        if dst.exists() {
+            if dst.is_dir() {
+                let _ = std::fs::remove_dir_all(&dst);
+            } else {
+                let _ = std::fs::remove_file(&dst);
+            }
+        }
+        let mv_res = std::fs::rename(&src_item, &dst);
+        let _ = std::fs::remove_dir_all(&tmp);
+        mv_res
+    } else {
+        archive.unpack(target)
+    }
+}
+
+fn handle_cp_get(conn: &mut VsockConn, req: &CpRequest) -> io::Result<()> {
+    let src = Path::new(&req.path);
+    let meta = std::fs::metadata(src)?;
+    let leaf = src
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?;
+    let mut writer = FrameWriter {
+        conn,
+        pending: Vec::with_capacity(CHUNK),
+    };
+    {
+        let mut builder = tar::Builder::new(&mut writer);
+        if meta.is_dir() {
+            builder.append_dir_all(leaf, src)?;
+        } else {
+            builder.append_path_with_name(src, leaf)?;
+        }
+        builder.finish()?;
+    }
+    writer.flush()
 }
 
 /// Build a properly escaped Windows command line from `argv`.
@@ -729,7 +1181,7 @@ fn build_env_block(overrides: &BTreeMap<String, String>, profile_user: Option<&s
     block
 }
 
-struct OwnedHandle(HANDLE);
+pub(crate) struct OwnedHandle(pub(crate) HANDLE);
 // SAFETY: Win32 kernel handles (pipes, processes, jobs, tokens) are valid across threads in this process.
 unsafe impl Send for OwnedHandle {}
 // SAFETY: Win32 kernel handles are synchronized by the OS kernel.
@@ -755,28 +1207,242 @@ struct ExecIdentity {
     desktop: Option<Vec<u16>>,
 }
 
-fn logon_primary_token(user: &str, password: &str) -> io::Result<OwnedHandle> {
-    let u = wide(user);
-    let d = wide(".");
-    let p = wide(password);
-    for logon_type in [LOGON32_LOGON_INTERACTIVE, LOGON32_LOGON_BATCH] {
-        let mut tok: HANDLE = null_mut();
-        // SAFETY: `LogonUserW` authenticates the local Windows account and writes a primary token.
-        let ok = unsafe {
-            LogonUserW(
-                u.as_ptr(),
-                d.as_ptr(),
-                p.as_ptr(),
-                logon_type,
-                LOGON32_PROVIDER_DEFAULT,
-                &mut tok,
-            )
+/// Ensure the least-privilege local `agent` account exists (for imported VMs that were not built
+/// by `osbx windows build-base`), generating an ephemeral random password via `NetUserAdd` when
+/// creating it. Never touches an existing `agent` user's password so RDP/auto-logon stays intact.
+fn ensure_local_agent_user() {
+    let mut name_w = wide("agent");
+    let mut existing: *mut u8 = null_mut();
+    // SAFETY: queries local SAM for `agent` account existence.
+    let rc = unsafe { NetUserGetInfo(null(), name_w.as_ptr(), 1, &mut existing) };
+    if rc == NERR_Success {
+        if !existing.is_null() {
+            // SAFETY: frees buffer returned by `NetUserGetInfo`.
+            unsafe {
+                NetApiBufferFree(existing.cast());
+            }
+        }
+        return;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut pw_w = wide(&format!(
+        "Osbx!{:016x}Az9#",
+        nanos ^ u128::from(std::process::id())
+    ));
+    let mut comment_w = wide("osbx least-privilege agent");
+    let info = USER_INFO_1 {
+        usri1_name: name_w.as_mut_ptr(),
+        usri1_password: pw_w.as_mut_ptr(),
+        usri1_password_age: 0,
+        usri1_priv: USER_PRIV_USER,
+        usri1_home_dir: null_mut(),
+        usri1_comment: comment_w.as_mut_ptr(),
+        usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD,
+        usri1_script_path: null_mut(),
+    };
+    // SAFETY: creates local `agent` user with an ephemeral password.
+    let add_rc = unsafe { NetUserAdd(null(), 1, (&info as *const USER_INFO_1).cast(), null_mut()) };
+    if add_rc == NERR_Success {
+        let group_w = wide("Users");
+        let member = LOCALGROUP_MEMBERS_INFO_3 {
+            lgrmi3_domainandname: name_w.as_mut_ptr(),
         };
-        if ok != 0 {
-            return Ok(OwnedHandle(tok));
+        // SAFETY: adds newly created `agent` user to local `Users` group.
+        unsafe {
+            NetLocalGroupAddMembers(
+                null(),
+                group_w.as_ptr(),
+                3,
+                (&member as *const LOCALGROUP_MEMBERS_INFO_3).cast(),
+                1,
+            );
         }
     }
-    Err(io::Error::last_os_error())
+}
+
+fn enable_process_privilege(name: &str) {
+    let mut tok: HANDLE = null_mut();
+    // SAFETY: opens current process token to enable a held LocalSystem privilege.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut tok,
+        )
+    } == 0
+    {
+        return;
+    }
+    let tok = OwnedHandle(tok);
+    let priv_w = wide(name);
+    let mut luid = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    // SAFETY: looks up privilege LUID by name.
+    if unsafe { LookupPrivilegeValueW(null(), priv_w.as_ptr(), &mut luid) } != 0 {
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        // SAFETY: enables the privilege on our own process token.
+        unsafe {
+            AdjustTokenPrivileges(tok.0, 0, &tp, 0, null_mut(), null_mut());
+        }
+    }
+}
+
+/// Obtain a primary token for a local Windows user via passwordless S4U logon (`LsaLogonUser`
+/// with `MsV1_0S4ULogon`). Works under `LocalSystem` (`SeTcbPrivilege`) with zero hardcoded
+/// passwords and works identically on imported VMs with arbitrary user passwords.
+fn s4u_primary_token(user: &str) -> io::Result<OwnedHandle> {
+    enable_process_privilege("SeTcbPrivilege");
+    let mut lsa_h: HANDLE = null_mut();
+    // SAFETY: opens an untrusted LSA handle (sufficient for S4U when caller holds `SeTcbPrivilege`).
+    let st = unsafe { LsaConnectUntrusted(&mut lsa_h) };
+    if st < 0 {
+        return Err(win_err_to_io("LsaConnectUntrusted", st));
+    }
+    struct LsaGuard(HANDLE);
+    impl Drop for LsaGuard {
+        fn drop(&mut self) {
+            // SAFETY: deregisters LSA handle opened above.
+            unsafe {
+                LsaDeregisterLogonProcess(self.0);
+            }
+        }
+    }
+    let lsa = LsaGuard(lsa_h);
+
+    let mut pkg_name = b"MICROSOFT_AUTHENTICATION_PACKAGE_V1_0".to_vec();
+    let pkg_lsa = LSA_STRING {
+        Length: pkg_name.len() as u16,
+        MaximumLength: pkg_name.len() as u16,
+        Buffer: pkg_name.as_mut_ptr(),
+    };
+    let mut auth_pkg: u32 = 0;
+    // SAFETY: looks up MSV1_0 authentication package ID.
+    let st = unsafe { LsaLookupAuthenticationPackage(lsa.0, &pkg_lsa, &mut auth_pkg) };
+    if st < 0 {
+        return Err(win_err_to_io("LsaLookupAuthenticationPackage", st));
+    }
+
+    let domain = std::env::var("COMPUTERNAME").unwrap_or_else(|_| ".".into());
+    let user_u16: Vec<u16> = OsStr::new(user).encode_wide().collect();
+    let dom_u16: Vec<u16> = OsStr::new(&domain).encode_wide().collect();
+    let hdr_size = std::mem::size_of::<MSV1_0_S4U_LOGON>();
+    let user_bytes = user_u16.len() * 2;
+    let dom_bytes = dom_u16.len() * 2;
+    let total_size = hdr_size + user_bytes + dom_bytes;
+    let mut buf = vec![0u8; total_size];
+
+    let user_ptr = buf.as_mut_ptr().wrapping_add(hdr_size) as *mut u16;
+    let dom_ptr = buf.as_mut_ptr().wrapping_add(hdr_size + user_bytes) as *mut u16;
+    // SAFETY: copies UTF-16 user and domain strings into the contiguous S4U auth buffer.
+    unsafe {
+        std::ptr::copy_nonoverlapping(user_u16.as_ptr(), user_ptr, user_u16.len());
+        std::ptr::copy_nonoverlapping(dom_u16.as_ptr(), dom_ptr, dom_u16.len());
+        let s4u = buf.as_mut_ptr() as *mut MSV1_0_S4U_LOGON;
+        (*s4u).MessageType = MsV1_0S4ULogon;
+        (*s4u).Flags = 0;
+        (*s4u).UserPrincipalName = LSA_UNICODE_STRING {
+            Length: user_bytes as u16,
+            MaximumLength: user_bytes as u16,
+            Buffer: user_ptr,
+        };
+        (*s4u).DomainName = LSA_UNICODE_STRING {
+            Length: dom_bytes as u16,
+            MaximumLength: dom_bytes as u16,
+            Buffer: dom_ptr,
+        };
+    }
+
+    let mut origin_bytes = b"osbx-ag".to_vec();
+    let origin = LSA_STRING {
+        Length: origin_bytes.len() as u16,
+        MaximumLength: origin_bytes.len() as u16,
+        Buffer: origin_bytes.as_mut_ptr(),
+    };
+    let source = TOKEN_SOURCE {
+        SourceName: [
+            b'o' as i8, b's' as i8, b'b' as i8, b'x' as i8, b'-' as i8, b'a' as i8, b'g' as i8, 0,
+        ],
+        SourceIdentifier: LUID {
+            LowPart: 1,
+            HighPart: 0,
+        },
+    };
+
+    let mut last_err = io::Error::other("LsaLogonUser failed");
+    // MSV1_0 S4U supports Batch (4) and Network (3) logon types; standard non-admin accounts
+    // (`Users`) hold `SeNetworkLogonRight` by default even when `SeBatchLogonRight` is absent.
+    for logon_type in [
+        SECURITY_LOGON_TYPE(4),
+        SECURITY_LOGON_TYPE(3),
+        SECURITY_LOGON_TYPE(2),
+    ] {
+        let mut profile: *mut std::ffi::c_void = null_mut();
+        let mut profile_len: u32 = 0;
+        let mut logon_id = LUID {
+            LowPart: 0,
+            HighPart: 0,
+        };
+        let mut tok: HANDLE = null_mut();
+        // SAFETY: `QUOTA_LIMITS` is plain old data.
+        let mut quotas: QUOTA_LIMITS = unsafe { std::mem::zeroed() };
+        let mut sub_status: i32 = 0;
+        // SAFETY: performs passwordless S4U logon for local account `user`.
+        let status = unsafe {
+            LsaLogonUser(
+                lsa.0,
+                &origin,
+                logon_type,
+                auth_pkg,
+                buf.as_ptr().cast(),
+                buf.len() as u32,
+                null(),
+                &source,
+                &mut profile,
+                &mut profile_len,
+                &mut logon_id,
+                &mut tok,
+                &mut quotas,
+                &mut sub_status,
+            )
+        };
+        if !profile.is_null() {
+            // SAFETY: frees LSA-allocated profile buffer.
+            unsafe {
+                LsaFreeReturnBuffer(profile);
+            }
+        }
+        if status >= 0 && !tok.is_null() {
+            let raw = OwnedHandle(tok);
+            let mut primary: HANDLE = null_mut();
+            // SAFETY: ensures returned token is a primary token for `CreateProcessAsUserW`.
+            let ok = unsafe {
+                DuplicateTokenEx(
+                    raw.0,
+                    TOKEN_ALL_ACCESS,
+                    null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut primary,
+                )
+            };
+            if ok != 0 {
+                return Ok(OwnedHandle(primary));
+            }
+            return Ok(raw);
+        }
+        last_err = win_err_to_io("LsaLogonUser(S4U)", status);
+    }
+    Err(last_err)
 }
 
 /// Session 0 -> Session 1 GUI bridge: find the active interactive WTS session and duplicate its
@@ -857,13 +1523,13 @@ fn resolve_exec_identity(req: &ExecRequest) -> io::Result<ExecIdentity> {
             })
         }
         Some(u) if u.eq_ignore_ascii_case("administrator") || u.eq_ignore_ascii_case("admin") => {
-            match logon_primary_token("Administrator", ADMIN_PASSWORD) {
+            match s4u_primary_token("Administrator") {
                 Ok(tok) => Ok(ExecIdentity {
                     token: Some(tok),
                     profile_user: Some("Administrator".into()),
                     desktop: None,
                 }),
-                // Fallback to LocalSystem (still elevated, no UAC) if Administrator password changed.
+                // Fallback to LocalSystem (still elevated, no UAC) if Administrator is disabled.
                 Err(_) => Ok(ExecIdentity {
                     token: None,
                     profile_user: Some("Administrator".into()),
@@ -872,8 +1538,8 @@ fn resolve_exec_identity(req: &ExecRequest) -> io::Result<ExecIdentity> {
             }
         }
         None => {
-            // Least-privilege default: run as the non-admin `agent` user when present.
-            match logon_primary_token("agent", AGENT_PASSWORD) {
+            // Least-privilege default: run as the non-admin `agent` user via passwordless S4U.
+            match s4u_primary_token("agent") {
                 Ok(tok) => Ok(ExecIdentity {
                     token: Some(tok),
                     profile_user: Some("agent".into()),
@@ -887,17 +1553,22 @@ fn resolve_exec_identity(req: &ExecRequest) -> io::Result<ExecIdentity> {
             }
         }
         Some(u) if u.eq_ignore_ascii_case("agent") => {
-            let tok = logon_primary_token("agent", AGENT_PASSWORD)?;
+            let tok = s4u_primary_token("agent")?;
             Ok(ExecIdentity {
                 token: Some(tok),
                 profile_user: Some("agent".into()),
                 desktop: None,
             })
         }
-        Some(other) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsupported Windows user {other:?} (supported: agent, Administrator, SYSTEM)"),
-        )),
+        Some(other) => {
+            // Allow arbitrary local user accounts on imported VMs via passwordless S4U logon.
+            let tok = s4u_primary_token(other)?;
+            Ok(ExecIdentity {
+                token: Some(tok),
+                profile_user: Some(other.to_owned()),
+                desktop: None,
+            })
+        }
     }
 }
 
@@ -1434,10 +2105,19 @@ fn install_ca_and_proxy(pem_path: &str) -> io::Result<()> {
 }
 
 fn configure_windows_proxy() -> io::Result<()> {
-    // 1. WinHTTP (PowerShell Invoke-WebRequest, .NET HttpClient, winget, services)
-    let _ = Command::new("netsh")
-        .args(["winhttp", "set", "proxy", GUEST_PROXY_ADDR, "<local>"])
-        .status();
+    // 1. WinHTTP (PowerShell Invoke-WebRequest, .NET HttpClient, winget, services) via native API
+    //    (zero `netsh.exe` subprocesses).
+    let mut proxy_w = wide(GUEST_PROXY_ADDR);
+    let mut bypass_w = wide("<local>");
+    let mut winhttp_info = WINHTTP_PROXY_INFO {
+        dwAccessType: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        lpszProxy: proxy_w.as_mut_ptr(),
+        lpszProxyBypass: bypass_w.as_mut_ptr(),
+    };
+    // SAFETY: sets machine-wide WinHTTP default proxy configuration directly via winhttp.dll.
+    unsafe {
+        WinHttpSetDefaultProxyConfiguration(&mut winhttp_info);
+    }
     // 2. WinINET (Chromium/Edge, PowerShell 5.1/.NET WebRequest, Visual Studio Installer, NuGet)
     // Set both HKCU and machine-wide HKLM (`ProxySettingsPerUser = 0`) so SYSTEM services and
     // interactive users inherit 127.0.0.1:3128 automatically.
