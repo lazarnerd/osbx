@@ -4,7 +4,7 @@ members = ["crates/osbx-policy", "crates/osbx-spec", "crates/osbx-cli", "crates/
 exclude = ["third_party"]
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.90"

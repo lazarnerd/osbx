@@ -278,6 +278,9 @@ enum WindowsCmd {
         /// Attach an emulated CRB vTPM 2.0 device during installation (Windows 11)
         #[arg(long)]
         vtpm: bool,
+        /// Optional Windows product key (omit to skip the Product Key screen automatically)
+        #[arg(long)]
+        product_key: Option<String>,
         /// Maximum minutes to wait for unattended setup
         #[arg(long, default_value_t = 45)]
         timeout_mins: u64,
@@ -771,6 +774,7 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                     agent_exe,
                     winfsp,
                     vtpm,
+                    product_key,
                     timeout_mins,
                 },
         } => {
@@ -797,6 +801,7 @@ fn lifecycle_cmd(cmd: Cmd) -> ExitCode {
                 agent_exe,
                 winfsp_msi: winfsp,
                 vtpm,
+                product_key,
                 timeout_mins,
             }))
         }

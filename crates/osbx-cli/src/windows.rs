@@ -44,7 +44,9 @@ impl WindowsProfile {
         match self {
             Self::Core => 1,
             Self::Desktop => 2,
-            Self::Win11 => 1,
+            // Multi-edition Windows 11 Client ISOs place Windows 11 Pro (with RDP server) at index 6
+            // (pass `--image-index 1` for single-edition Enterprise Evaluation ISOs).
+            Self::Win11 => 6,
         }
     }
 
@@ -100,6 +102,8 @@ pub struct BuildBaseOpts {
     pub winfsp_msi: Option<PathBuf>,
     /// Attach an emulated CRB vTPM 2.0 device during installation (recommended for Windows 11).
     pub vtpm: bool,
+    /// Optional Windows product key (empty by default, skipping the interactive Product Key screen).
+    pub product_key: Option<String>,
     /// Maximum minutes to wait for unattended Windows Setup to finish (default: 45).
     pub timeout_mins: u64,
 }
@@ -196,7 +200,12 @@ fn find_winfsp_msi(override_path: Option<&Path>) -> Option<PathBuf> {
 
 /// Generate a UEFI GPT `autounattend.xml` for headless unattended Windows Server / Win 11 install
 /// using `virtio-win` (`viostor`, `viosock`, `viofs`) drivers and `osbx-agent.exe`.
-pub fn generate_autounattend_xml(profile: WindowsProfile, image_index: u32, vtpm: bool) -> String {
+pub fn generate_autounattend_xml(
+    profile: WindowsProfile,
+    image_index: u32,
+    vtpm: bool,
+    product_key: Option<&str>,
+) -> String {
     let os_sub = profile.virtio_subdir();
     let mut driver_paths = String::new();
     for (idx, drive) in ['C', 'D', 'E', 'F'].iter().enumerate() {
@@ -205,15 +214,31 @@ pub fn generate_autounattend_xml(profile: WindowsProfile, image_index: u32, vtpm
             "        <PathAndCredentials wcm:action=\"add\" wcm:keyValue=\"{key}\"><Path>{drive}:\\viostor\\{os_sub}\\amd64</Path></PathAndCredentials>\n"
         ));
     }
-    let winpe_run_sync = if profile == WindowsProfile::Win11 && !vtpm {
-        r#"      <RunSynchronous>
-        <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add"><Order>2</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add"><Order>3</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
-      </RunSynchronous>
-"#
+    // Windows 11 Setup checks Secure Boot (not enrolled in standard OVMF_CODE_4M.fd) and TPM 2.0.
+    // Always bypass Secure Boot + RAM checks on Win11; bypass TPM check when `--vtpm` is off.
+    let winpe_run_sync = if profile == WindowsProfile::Win11 {
+        let mut cmds = String::from("      <RunSynchronous>\n");
+        cmds.push_str(
+            "        <RunSynchronousCommand wcm:action=\"add\"><Order>1</Order><Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>\n",
+        );
+        cmds.push_str(
+            "        <RunSynchronousCommand wcm:action=\"add\"><Order>2</Order><Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>\n",
+        );
+        if !vtpm {
+            cmds.push_str(
+                "        <RunSynchronousCommand wcm:action=\"add\"><Order>3</Order><Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>\n",
+            );
+        }
+        cmds.push_str("      </RunSynchronous>\n");
+        cmds
     } else {
-        ""
+        String::new()
+    };
+    let product_key_xml = {
+        let k = product_key.unwrap_or("");
+        format!(
+            "        <ProductKey>\n          <Key>{k}</Key>\n          <WillShowUI>Never</WillShowUI>\n        </ProductKey>\n"
+        )
     };
     let specialize_bypass_nro = if profile == WindowsProfile::Win11 {
         r#"    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
@@ -267,7 +292,7 @@ pub fn generate_autounattend_xml(profile: WindowsProfile, image_index: u32, vtpm
         </OSImage>
       </ImageInstall>
       <UserData>
-        <AcceptEula>true</AcceptEula>
+{product_key_xml}        <AcceptEula>true</AcceptEula>
         <FullName>osbx</FullName>
         <Organization>osbx</Organization>
       </UserData>
@@ -427,7 +452,13 @@ pub fn build_base(o: &BuildBaseOpts) -> io::Result<()> {
     let mut seed_files = vec![
         IsoFile {
             name: "autounattend.xml".into(),
-            data: generate_autounattend_xml(o.profile, image_index, o.vtpm).into_bytes(),
+            data: generate_autounattend_xml(
+                o.profile,
+                image_index,
+                o.vtpm,
+                o.product_key.as_deref(),
+            )
+            .into_bytes(),
         },
         IsoFile {
             name: "setup_osbx.cmd".into(),
@@ -616,23 +647,27 @@ mod tests {
 
     #[test]
     fn autounattend_xml_contains_gpt_and_virtio_drivers() {
-        let xml = generate_autounattend_xml(WindowsProfile::Core, 1, false);
+        let xml = generate_autounattend_xml(WindowsProfile::Core, 1, false, None);
         assert!(xml.contains("<Key>/IMAGE/INDEX</Key><Value>1</Value>"));
         assert!(xml.contains("viostor\\2k25\\amd64"));
         assert!(xml.contains("<Type>EFI</Type>"));
         assert!(xml.contains("setup_osbx.cmd"));
+        assert!(xml.contains("<WillShowUI>Never</WillShowUI>"));
         assert!(!xml.contains("BypassTPMCheck"));
     }
 
     #[test]
-    fn win11_profile_adds_labconfig_when_vtpm_disabled() {
-        let xml_no_tpm = generate_autounattend_xml(WindowsProfile::Win11, 1, false);
+    fn win11_profile_adds_labconfig_and_skips_product_key() {
+        let xml_no_tpm = generate_autounattend_xml(WindowsProfile::Win11, 6, false, None);
         assert!(xml_no_tpm.contains("BypassTPMCheck"));
+        assert!(xml_no_tpm.contains("BypassSecureBootCheck"));
         assert!(xml_no_tpm.contains("BypassNRO"));
+        assert!(xml_no_tpm.contains("<Key></Key>"));
         assert!(xml_no_tpm.contains("viostor\\w11\\amd64"));
 
-        let xml_with_tpm = generate_autounattend_xml(WindowsProfile::Win11, 1, true);
+        let xml_with_tpm = generate_autounattend_xml(WindowsProfile::Win11, 6, true, None);
         assert!(!xml_with_tpm.contains("BypassTPMCheck"));
+        assert!(xml_with_tpm.contains("BypassSecureBootCheck"));
         assert!(xml_with_tpm.contains("BypassNRO"));
     }
 
